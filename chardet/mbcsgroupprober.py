@@ -29,28 +29,33 @@
 from .big5prober import Big5Prober
 from .charsetgroupprober import CharSetGroupProber
 from .cp949prober import CP949Prober
-from .enums import LanguageFilter
+from .enums import EncodingEra, LanguageFilter
 from .eucjpprober import EUCJPProber
 from .euckrprober import EUCKRProber
-from .euctwprober import EUCTWProber
-from .gb2312prober import GB2312Prober
+from .gb18030prober import GB18030Prober
 from .johabprober import JOHABProber
 from .sjisprober import SJISProber
 from .utf8prober import UTF8Prober
 
 
 class MBCSGroupProber(CharSetGroupProber):
-    def __init__(self, lang_filter: LanguageFilter = LanguageFilter.NONE) -> None:
-        super().__init__(lang_filter=lang_filter)
+    def __init__(
+        self,
+        *,
+        lang_filter: LanguageFilter = LanguageFilter.ALL,
+        encoding_era: EncodingEra = EncodingEra.ALL,
+    ) -> None:
+        super().__init__(lang_filter=lang_filter, encoding_era=encoding_era)
         self.probers = [
             UTF8Prober(),
             SJISProber(),
             EUCJPProber(),
-            GB2312Prober(),
+            GB18030Prober(),  # Detects both GB18030 and GB2312 (subset)
             EUCKRProber(),
             CP949Prober(),
             Big5Prober(),
-            EUCTWProber(),
             JOHABProber(),
         ]
+        # Filter probers based on encoding era and language
+        self.probers = self._filter_probers(self.probers)
         self.reset()
