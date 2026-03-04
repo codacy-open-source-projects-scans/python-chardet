@@ -1,103 +1,75 @@
-Frequently asked questions
+Frequently Asked Questions
 ==========================
 
-What is character encoding?
+Why does detect() return None for encoding?
+--------------------------------------------
+
+chardet returns ``None`` when the data appears to be binary rather than
+text. This happens when the data contains null bytes or a high proportion
+of control characters that don't match any known text encoding.
+
+.. code-block:: python
+
+   result = chardet.detect(b"\x00\x01\x02\x03")
+   # {'encoding': None, 'confidence': 0.95, 'language': None}
+
+How do I increase accuracy?
+----------------------------
+
+- **Provide more data.** The default limit of 200,000 bytes is generous
+  and most detections converge well within that.  If you are passing very
+  short strings (under a few hundred bytes), providing more data may help.
+- **Restrict the encoding era.** By default, chardet considers all
+  supported encodings. If you know your data only uses modern web
+  encodings, pass ``encoding_era=EncodingEra.MODERN_WEB`` to narrow the
+  candidate set and reduce false positives.
+- **Use detect_all().** If the top result is wrong, the correct encoding
+  may be the second candidate. :func:`chardet.detect_all` returns all
+  candidates ranked by confidence.
+
+How is chardet different from charset-normalizer?
+--------------------------------------------------
+
+`charset-normalizer <https://github.com/jawah/charset_normalizer>`_ is
+an alternative encoding detector. Key differences:
+
+- **Accuracy:** chardet achieves 96.8% vs charset-normalizer's 89.1% on
+  the same test suite.
+- **Speed:** chardet is 7.5x faster with mypyc (494 vs 66 files/s),
+  5.1x faster pure Python (336 vs 66 files/s).
+- **Memory:** chardet uses 4.5x less peak memory (22.5 vs 102.2 MiB).
+- **Language detection:** chardet reports the detected language;
+  charset-normalizer does not.
+
+How is chardet different from cchardet?
+----------------------------------------
+
+`cchardet <https://github.com/faust-streaming/faust-cchardet>`_ wraps
+Mozilla's uchardet C/C++ library. Key differences:
+
+- **Accuracy:** chardet achieves 96.8% vs cchardet's 57.1%.
+- **Speed:** cchardet is faster (0.73s vs 6s) due to C implementation.
+- **Encoding breadth:** chardet supports 49 more encodings than cchardet,
+  including EBCDIC, Mac, Baltic, and BOM-less UTF-16/32.
+- **Dependencies:** chardet is pure Python with zero dependencies.
+  cchardet requires a C compiler to build from source.
+
+Is chardet thread-safe?
+-------------------------
+
+:func:`chardet.detect` and :func:`chardet.detect_all` are fully
+thread-safe and can be called concurrently from any number of threads.
+
+:class:`~chardet.UniversalDetector` instances are **not** thread-safe.
+Create one instance per thread when using the streaming API.
+
+``UniversalDetector`` uses the same detection pipeline as ``detect()``
+and ``detect_all()``, so results are identical regardless of which API
+you use.
+
+Does chardet work on PyPy?
 ---------------------------
 
-When you think of “text”, you probably think of “characters and symbols
-I see on my computer screen”. But computers don’t deal in characters and
-symbols; they deal in bits and bytes. Every piece of text you’ve ever
-seen on a computer screen is actually stored in a particular *character
-encoding*. There are many different character encodings, some optimized
-for particular languages like Russian or Chinese or English, and others
-that can be used for multiple languages. Very roughly speaking, the
-character encoding provides a mapping between the stuff you see on your
-screen and the stuff your computer actually stores in memory and on
-disk.
-
-In reality, it’s more complicated than that. Many characters are common
-to multiple encodings, but each encoding may use a different sequence of
-bytes to actually store those characters in memory or on disk. So you
-can think of the character encoding as a kind of decryption key for the
-text. Whenever someone gives you a sequence of bytes and claims it’s
-“text”, you need to know what character encoding they used so you can
-decode the bytes into characters and display them (or process them, or
-whatever).
-
-What is character encoding auto-detection?
-------------------------------------------
-
-It means taking a sequence of bytes in an unknown character encoding,
-and attempting to determine the encoding so you can read the text. It’s
-like cracking a code when you don’t have the decryption key.
-
-Isn’t that impossible?
-----------------------
-
-In general, yes. However, some encodings are optimized for specific
-languages, and languages are not random. Some character sequences pop up
-all the time, while other sequences make no sense. A person fluent in
-English who opens a newspaper and finds “txzqJv 2!dasd0a QqdKjvz” will
-instantly recognize that that isn’t English (even though it is composed
-entirely of English letters). By studying lots of “typical” text, a
-computer algorithm can simulate this kind of fluency and make an
-educated guess about a text’s language.
-
-In other words, encoding detection is really language detection,
-combined with knowledge of which languages tend to use which character
-encodings.
-
-Who wrote this detection algorithm?
------------------------------------
-
-This library is a port of `the auto-detection code in
-Mozilla <https://www-archive.mozilla.org/projects/intl/chardet.html>`__.
-The original structure has been largely maintained, though chardet 6.0
-significantly expanded the detection capabilities by adding unified
-bigram language models (trained on the
-`CulturaX <https://huggingface.co/datasets/uonlp/CulturaX>`__ multilingual
-corpus) for all single-byte encodings across 45+ languages.
-
-You may also be interested in the research paper which led to the
-Mozilla implementation, `A composite approach to language/encoding
-detection <https://www-archive.mozilla.org/projects/intl/UniversalCharsetDetection.html>`__.
-
-Yippie! Screw the standards, I’ll just auto-detect everything!
---------------------------------------------------------------
-
-Don’t do that. Virtually every format and protocol contains a method for
-specifying character encoding.
-
--  HTTP can define a ``charset`` parameter in the ``Content-type``
-   header.
--  HTML documents can define a ``<meta http-equiv="content-type">``
-   element in the ``<head>`` of a web page.
--  XML documents can define an ``encoding`` attribute in the XML prolog.
-
-If text comes with explicit character encoding information, you should
-use it. If the text has no explicit information, but the relevant
-standard defines a default encoding, you should use that. (This is
-harder than it sounds, because standards can overlap. If you fetch an
-XML document over HTTP, you need to support both standards *and* figure
-out which one wins if they give you conflicting information.)
-
-Despite the complexity, it’s worthwhile to follow standards and `respect
-explicit character encoding
-information <http://www.w3.org/2001/tag/doc/mime-respect>`__. It will
-almost certainly be faster and more accurate than trying to auto-detect
-the encoding. It will also make the world a better place, since your
-program will interoperate with other programs that follow the same
-standards.
-
-Why bother with auto-detection if it’s slow, inaccurate, and non-standard?
---------------------------------------------------------------------------
-
-Sometimes you receive text with verifiably inaccurate encoding
-information. Or text without any encoding information, and the specified
-default encoding doesn’t work. There are also some poorly designed
-standards that have no way to specify encoding at all.
-
-If following the relevant standards gets you nowhere, *and* you decide
-that processing the text is more important than maintaining
-interoperability, then you can try to auto-detect the character encoding
-as a last resort.
+Yes. chardet is pure Python and works on PyPy without modification.
+The optional mypyc compilation is CPython-only; PyPy uses the pure-Python
+code path automatically.

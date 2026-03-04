@@ -1,25 +1,38 @@
-chardet
-=======
+chardet documentation
+=====================
 
-Character encoding auto-detection in Python. As smart as your browser.
-Open source.
+**chardet** is a universal character encoding detector for Python. It analyzes
+byte strings and returns the detected encoding, confidence score, and language.
 
-Documentation
-=============
+.. code-block:: python
+
+   import chardet
+
+   result = chardet.detect("It\u2019s a lovely day \u2014 let\u2019s grab coffee.".encode("utf-8"))
+   print(result)
+   # {'encoding': 'utf-8', 'confidence': 0.99, 'language': 'es'}
+
+chardet 7.0 is a ground-up, MIT-licensed rewrite — same package name, same
+public API, drop-in replacement for chardet 5.x/6.x. Python 3.10+, zero
+runtime dependencies, works on PyPy.
+
+- **96.8% accuracy** on 2,179 test files
+- **41x faster** than chardet 6.0.0 with mypyc, **28x faster** pure Python
+- **7.5x faster** than charset-normalizer with mypyc, **5.1x faster** pure Python
+- **Language detection** for every result (90.5% accuracy)
+- **99 encodings** across six encoding eras
+- **Thread-safe** ``detect()`` and ``detect_all()``
 
 .. toctree::
    :maxdepth: 2
+   :caption: Contents
+   :hidden:
 
    usage
    supported-encodings
-   faq
    how-it-works
-   api/modules
-
-
-Indices and tables
-==================
-
-* :ref:`genindex`
-* :ref:`modindex`
-* :ref:`search`
+   performance
+   faq
+   api/index
+   contributing
+   changelog

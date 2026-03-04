@@ -1,144 +1,99 @@
-How it works
+How It Works
 ============
 
-This is a guide to how chardet's detection algorithm works internally.
+chardet uses a multi-stage detection pipeline. Each stage either returns a
+definitive result or passes to the next, progressing from cheap deterministic
+checks to more expensive statistical analysis.
 
-You may also be interested in the research paper which originally inspired
-the Mozilla implementation that chardet is based on: `A composite approach
-to language/encoding
-detection <https://www-archive.mozilla.org/projects/intl/UniversalCharsetDetection.html>`__.
+Detection Pipeline
+------------------
 
-Overview
---------
+When you call :func:`chardet.detect`, data flows through these stages in
+order:
 
-The main entry point is ``universaldetector.py``, which contains the
-``UniversalDetector`` class. (The ``detect`` function in
-``chardet/__init__.py`` is a convenience wrapper that creates a
-``UniversalDetector``, feeds it data, and returns the result.)
+1. **BOM Detection** — Checks for a byte order mark at the start of the
+   data. If found, returns the corresponding encoding (UTF-8-SIG,
+   UTF-16-LE/BE, UTF-32-LE/BE) with confidence 1.0.
 
-``UniversalDetector`` processes input through a pipeline of probers,
-each specialized for a category of encodings. Detection proceeds
-through these stages in order:
+2. **UTF-16/32 Patterns** — Detects BOM-less UTF-16 and UTF-32 by
+   analyzing null-byte patterns. Interleaved null bytes strongly indicate
+   UTF-16; groups of three null bytes indicate UTF-32.
 
-#. **BOM detection** — immediate identification of UTF-8-SIG, UTF-16,
-   or UTF-32 via byte order marks.
-#. **UTF-16/32 without BOM** — ``UTF1632Prober`` detects UTF-16/32 by
-   analyzing null-byte patterns and byte distributions.
-#. **Escaped encodings** — ``EscCharSetProber`` detects 7-bit encodings
-   that use escape sequences (``ISO-2022-JP``, ``ISO-2022-KR``,
-   ``HZ-GB-2312``).
-#. **Multi-byte encodings** — ``MBCSGroupProber`` runs probers for
-   ``UTF-8``, ``GB18030``, ``Big5``, ``EUC-JP``, ``EUC-KR``,
-   ``Shift-JIS``, ``CP949``, and ``Johab``.
-#. **Single-byte encodings** — ``SBCSGroupProber`` runs hundreds of
-   encoding+language-specific probers using bigram frequency models.
-#. **Encoding era filtering** — results are filtered by the requested
-   ``EncodingEra`` tier, and close confidence scores are broken by
-   preferring more modern encodings.
+3. **Escape Sequences** — Identifies escape-based encodings like
+   ISO-2022-JP, ISO-2022-KR, and HZ-GB-2312 by matching their
+   characteristic escape byte sequences.
 
-BOM detection
--------------
+4. **Binary Detection** — If the data contains null bytes or a high
+   proportion of control characters without matching any of the above,
+   it is classified as binary (encoding ``None``).
 
-If the text starts with a byte order mark (BOM), ``UniversalDetector``
-immediately identifies the encoding as ``UTF-8-SIG``, ``UTF-16 BE/LE``,
-or ``UTF-32 BE/LE`` and returns the result without further processing.
+5. **Markup Charset** — Extracts explicit charset declarations from
+   ``<meta charset="...">`` tags or ``<?xml encoding="..."?>``
+   processing instructions.
 
-UTF-16/32 without BOM
-----------------------
+6. **ASCII Check** — If every byte is in the 7-bit ASCII range, returns
+   ``ascii`` immediately.
 
-``UTF1632Prober`` (defined in ``utf1632prober.py``) detects UTF-16 and
-UTF-32 encoded text that lacks a BOM. It analyzes the distribution of
-null bytes: UTF-32 produces characteristic patterns of 3 null bytes per
-character for ASCII-range text, while UTF-16 produces alternating null
-and non-null bytes.
+7. **UTF-8 Validation** — Tests whether the data is valid UTF-8 by
+   checking multi-byte sequence structure. UTF-8 has very distinctive
+   byte patterns that are unlikely to occur in other encodings.
 
-Escaped encodings
+8. **Byte Validity Filtering** — Attempts to decode the data with each
+   candidate encoding's Python codec. Any encoding that raises a decode
+   error is eliminated.
+
+9. **CJK Gating** — Eliminates CJK candidates that lack genuine
+   multi-byte structure. Checks pair ratio, high-byte count, byte
+   coverage, and lead byte diversity to prevent false CJK matches on
+   single-byte data.
+
+10. **Structural Probing** — For multi-byte encodings (CJK), analyzes
+    byte sequences to verify they follow the encoding's structural rules
+    (lead byte / trail byte patterns, valid ranges).
+
+11. **Statistical Scoring** — Scores remaining candidates using pre-trained
+    bigram frequency models. Each model captures the characteristic byte
+    pair frequencies of a language written in a specific encoding. The
+    candidate with the highest score wins.
+
+12. **Post-processing** — Resolves confusion groups (encodings that are
+    statistically hard to distinguish), demotes niche Latin encodings
+    when a more common alternative scores similarly, and promotes KOI8-T
+    when appropriate.
+
+Confidence Scores
 -----------------
 
-If the text contains escape sequences, ``UniversalDetector`` creates an
-``EscCharSetProber`` (defined in ``escprober.py``) which runs state
-machines for ``HZ-GB-2312``, ``ISO-2022-JP``, and ``ISO-2022-KR``
-(defined in ``escsm.py``). Each state machine processes the text one
-byte at a time. If any state machine uniquely identifies the encoding,
-the result is returned immediately. State machines that encounter
-illegal sequences are dropped.
+The confidence score (0.0 to 1.0) reflects how the result was determined:
 
-Multi-byte encodings
---------------------
+- **1.0** — BOM detected (definitive)
+- **0.95** — Deterministic match (escape sequences, markup charset, ASCII,
+  BOM-less UTF-16/32, binary detection)
+- **0.80–0.99** — UTF-8 detection. Confidence scales with the proportion of
+  multi-byte sequences in the data.
+- **< 0.95** — Statistical ranking. Higher scores mean the data better
+  matches the encoding's expected byte pair frequencies.
 
-When high-bit characters are detected, ``UniversalDetector`` creates a
-``MBCSGroupProber`` (defined in ``mbcsgroupprober.py``) which manages
-probers for each multi-byte encoding:
+Internal pipeline stages may temporarily boost confidence above 1.0 for
+ranking purposes; ``run_pipeline`` clamps all final results to [0.0, 1.0].
 
-- ``UTF8Prober`` — UTF-8
-- ``GB18030Prober`` — GB18030 / GB2312 (Simplified Chinese)
-- ``Big5Prober`` — Big5 (Traditional Chinese)
-- ``EUCJPProber`` — EUC-JP (Japanese)
-- ``SJISProber`` — Shift-JIS (Japanese)
-- ``EUCKRProber`` — EUC-KR (Korean)
-- ``CP949Prober`` — CP949 (Korean)
-- ``JOHABProber`` — Johab (Korean)
+A confidence of ``0.95`` with encoding ``None`` means the data appears to be
+binary (not text).
 
-Each multi-byte prober inherits from ``MultiByteCharSetProber`` (defined
-in ``mbcharsetprober.py``) and uses two analysis techniques:
+Language Detection
+------------------
 
-**Coding state machines** (defined in ``mbcssm.py``) process the text
-one byte at a time, looking for byte sequences that are valid or invalid
-in the target encoding. An illegal sequence immediately eliminates that
-encoding from consideration. A uniquely identifying sequence produces an
-immediate positive result.
+chardet also returns the detected language alongside the encoding. Language
+detection uses three tiers:
 
-**Character distribution analysis** (defined in ``chardistribution.py``)
-uses language-specific frequency tables to measure how well the decoded
-characters match expected usage patterns. Once enough text has been
-processed, a confidence rating is calculated.
+1. **Single-language encodings** — Encodings like Big5 (Chinese), EUC-JP
+   (Japanese), or ISO-8859-7 (Greek) unambiguously identify the language.
 
-The case of Japanese is more complex. Single-character distribution
-analysis alone cannot always distinguish ``EUC-JP`` from ``Shift-JIS``,
-so ``SJISProber`` (defined in ``sjisprober.py``) also uses 2-character
-context analysis. ``SJISContextAnalysis`` and ``EUCJPContextAnalysis``
-(both defined in ``jpcntx.py``) check the frequency of Hiragana
-syllabary characters to help distinguish between the two encodings.
+2. **Multi-language encoding models** — For encodings shared across
+   languages (e.g., windows-1252 is used for French, German, Spanish,
+   etc.), the statistical scoring stage compares language-specific bigram
+   models and picks the best-matching language.
 
-Single-byte encodings
----------------------
-
-``SBCSGroupProber`` (defined in ``sbcsgroupprober.py``) manages hundreds
-of ``SingleByteCharSetProber`` instances, one for each combination of
-single-byte encoding and language. For example, ``Windows-1252`` is
-paired with English, French, German, Spanish, and many other Western
-European languages, while ``KOI8-R`` is paired with Russian.
-
-Every single-byte encoding is detected the same way: each
-``SingleByteCharSetProber`` (defined in ``sbcharsetprober.py``) takes a
-bigram language model as input. These models (stored in
-``lang*model.py`` files) define how frequently each pair of consecutive
-characters appears in typical text for that language and encoding. The
-prober tallies bigram frequencies in the input and calculates a
-confidence score.
-
-The bigram models are trained using the ``create_language_model.py``
-script from the CulturaX multilingual corpus, covering 45+ languages.
-This unified approach replaces the older system where only a few
-languages had trained models and Western encodings relied on
-special-case heuristics.
-
-Hebrew is handled as a special case by ``HebrewProber`` (defined in
-``hebrewprober.py``), which distinguishes between Visual Hebrew (stored
-right-to-left, displayed verbatim) and Logical Hebrew (stored in
-reading order, rendered right-to-left by the client) by analyzing the
-positions of final-form characters.
-
-Encoding era filtering and tie-breaking
----------------------------------------
-
-After all probers report their confidence scores, ``UniversalDetector``
-filters results by the requested ``EncodingEra``. Only encodings
-belonging to the selected era(s) are considered.
-
-When multiple encodings have very close confidence scores, the detector
-prefers encodings from more modern tiers (``MODERN_WEB`` over
-``LEGACY_ISO`` over ``LEGACY_MAC``, and so on). This prevents legacy
-encodings from winning ties against their modern equivalents.
-
-See :doc:`supported-encodings` for which encodings belong to each era.
+3. **UTF-8 fallback** — For Unicode encodings (UTF-8, UTF-16, UTF-32),
+   the detected text is scored against byte-level bigram models for all
+   supported languages.

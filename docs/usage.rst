@@ -1,198 +1,177 @@
 Usage
 =====
 
-Basic usage
------------
+Installation
+------------
 
-The easiest way to use chardet is with the ``detect`` function.
+.. code-block:: bash
 
+   pip install chardet
 
-Example: Using the ``detect`` function
---------------------------------------
+Basic Detection
+---------------
 
-The ``detect`` function takes a byte string and returns a dictionary
-containing the auto-detected character encoding, a confidence level
-from ``0`` to ``1``, and the detected language.
+Use :func:`chardet.detect` to detect the encoding of a byte string:
 
-.. code:: python
+.. code-block:: python
 
-    >>> import chardet
-    >>> chardet.detect('Strauß und Müller über Änderungen'.encode('windows-1252'))
-    {'encoding': 'WINDOWS-1252', 'confidence': 0.6316251912431836, 'language': 'German'}
+   import chardet
 
-The result dictionary always contains three keys:
+   result = chardet.detect(
+       "München ist die Hauptstadt Bayerns und eine der"
+       " schönsten Städte Deutschlands.".encode("windows-1252")
+   )
+   print(result)
+   # {'encoding': 'windows-1252', 'confidence': 0.34, 'language': 'de'}
 
-- ``encoding``: the detected encoding name (or ``None`` if detection failed)
-- ``confidence``: a float from ``0`` to ``1``
-- ``language``: the detected language (or ``''`` if not applicable)
+The result is a dictionary with three keys:
 
+- ``"encoding"`` — the detected encoding name (e.g., ``"utf-8"``,
+  ``"windows-1252"``), or ``None`` if detection failed
+- ``"confidence"`` — a float between 0 and 1
+- ``"language"`` — the detected language (e.g., ``"French"``), or ``None``
 
-Controlling how much data to process
--------------------------------------
+Multiple Candidates
+~~~~~~~~~~~~~~~~~~~
 
-By default, ``detect()`` reads up to 200 KB of input in 64 KB chunks.
-You can tune this with the ``max_bytes`` and ``chunk_size`` parameters:
+Use :func:`chardet.detect_all` to get all candidate encodings ranked by
+confidence:
 
-.. code:: python
+.. code-block:: python
 
-    import chardet
+   results = chardet.detect_all(data)
+   for r in results:
+       print(f"{r['encoding']}: {r['confidence']:.2f}")
 
-    # Process at most 50 KB, feeding 8 KB at a time internally
-    result = chardet.detect(data, max_bytes=50_000, chunk_size=8192)
+By default, results below the minimum confidence threshold (0.20) are
+filtered out. Pass ``ignore_threshold=True`` to see all candidates.
 
-These parameters also apply to ``detect_all``.
+Streaming Detection
+-------------------
 
+For large files or streaming data, use :class:`chardet.UniversalDetector`:
 
-Filtering by encoding era
---------------------------
+.. code-block:: python
 
-By default, ``detect()`` only considers modern web encodings (UTF-8,
-Windows-125x, CJK multi-byte, etc.). If you're working with legacy data,
-you can expand the search using the ``encoding_era`` parameter:
+   from chardet import UniversalDetector
 
-.. code:: python
+   detector = UniversalDetector()
+   with open("somefile.txt", "rb") as f:
+       for line in f:
+           detector.feed(line)
+           if detector.done:
+               break
+   detector.close()
+   print(detector.result)
 
-    from chardet import detect
-    from chardet.enums import EncodingEra
+Call :meth:`~chardet.UniversalDetector.reset` to reuse the detector for
+another file.
 
-    # Default: only modern web encodings
-    result = detect(data)
+The constructor accepts the same tuning parameters as :func:`~chardet.detect`:
 
-    # Include all encoding eras
-    result = detect(data, encoding_era=EncodingEra.ALL)
+.. code-block:: python
 
-    # Only consider DOS-era encodings
-    result = detect(data, encoding_era=EncodingEra.DOS)
+   detector = UniversalDetector(
+       encoding_era=EncodingEra.MODERN_WEB,  # restrict candidate encodings
+       max_bytes=50_000,                      # stop buffering after 50 KB
+   )
 
-    # Combine specific eras
-    result = detect(data, encoding_era=EncodingEra.MODERN_WEB | EncodingEra.LEGACY_ISO)
+Encoding Eras
+-------------
 
-See :doc:`supported-encodings` for which encodings belong to each era.
+By default, chardet considers all supported encodings for maximum
+accuracy. Use the ``encoding_era`` parameter to restrict the search to a
+specific subset:
 
+.. code-block:: python
 
-Getting all candidates with ``detect_all``
-------------------------------------------
+   from chardet import detect, EncodingEra
 
-If you want to see all candidate encodings rather than just the best
-guess, use ``detect_all``:
+   # Default: all encodings considered
+   result = detect(data)
 
-.. code:: python
+   # Restrict to modern web encodings only
+   result = detect(data, encoding_era=EncodingEra.MODERN_WEB)
 
-    >>> import chardet
-    >>> chardet.detect_all('Strauß und Müller über Änderungen'.encode('windows-1252'))[:3]
-    [{'encoding': 'WINDOWS-1252', 'confidence': 0.6316251912431836, 'language': 'German'},
-     {'encoding': 'WINDOWS-1250', 'confidence': 0.5220501710295528, 'language': 'Czech'},
-     {'encoding': 'WINDOWS-1257', 'confidence': 0.5197657012389119, 'language': 'Estonian'}]
+   # Only legacy ISO encodings
+   result = detect(data, encoding_era=EncodingEra.LEGACY_ISO)
 
-Results are sorted by confidence (highest first). ``detect_all`` accepts
-the same ``encoding_era``, ``should_rename_legacy``, ``max_bytes``, and
-``chunk_size`` parameters as ``detect``.
+Available eras (can be combined with ``|``):
 
+- :attr:`~chardet.EncodingEra.ALL` — All supported encodings (default)
+- :attr:`~chardet.EncodingEra.MODERN_WEB` — UTF-8, Windows codepages,
+  CJK encodings
+- :attr:`~chardet.EncodingEra.LEGACY_ISO` — ISO-8859 family
+- :attr:`~chardet.EncodingEra.LEGACY_MAC` — Mac encodings
+- :attr:`~chardet.EncodingEra.LEGACY_REGIONAL` — Regional codepages
+  (KOI8-T, KZ-1048, etc.)
+- :attr:`~chardet.EncodingEra.DOS` — DOS codepages (CP437, CP850, etc.)
+- :attr:`~chardet.EncodingEra.MAINFRAME` — EBCDIC encodings
 
-Advanced usage: incremental detection
---------------------------------------
+Legacy Renaming
+---------------
 
-In most cases, the ``max_bytes`` and ``chunk_size`` parameters on
-``detect()`` and ``detect_all()`` are sufficient for controlling how much
-data is processed. However, if you need to feed data from a custom source
-(such as a network stream or a decompressor), you can use
-``UniversalDetector`` directly.
+By default, chardet remaps legacy encoding names to their modern
+equivalents (e.g., ``"gb2312"`` becomes ``"gb18030"``). Set
+``should_rename_legacy=False`` to get the raw detection name:
 
-Create a ``UniversalDetector`` object, then call its ``feed`` method
-repeatedly with each block of data. If the detector reaches a minimum
-threshold of confidence, it will set ``detector.done`` to ``True``.
+.. code-block:: python
 
-Once you've exhausted the source data, call ``detector.close()`` to
-finalize detection. The result is then available in ``detector.result``.
+   # Default: legacy names are remapped
+   chardet.detect(data)
+   # {'encoding': 'gb18030', ...}
 
-.. code:: python
+   # Disable renaming to get the original detection name
+   chardet.detect(data, should_rename_legacy=False)
+   # {'encoding': 'gb2312', ...}
 
-    from chardet.universaldetector import UniversalDetector
+This applies to :func:`~chardet.detect`, :func:`~chardet.detect_all`,
+and :class:`~chardet.UniversalDetector`.
 
-    detector = UniversalDetector()
-    with open('mystery-file.txt', 'rb') as f:
-        for line in f:
-            detector.feed(line)
-            if detector.done:
-                break
-    detector.close()
-    print(detector.result)
+Limiting Bytes
+--------------
 
-``UniversalDetector`` also accepts ``encoding_era`` and ``max_bytes``
-parameters:
+By default, chardet examines up to 200,000 bytes. Use ``max_bytes`` to
+adjust:
 
-.. code:: python
+.. code-block:: python
 
-    from chardet.enums import EncodingEra
-    from chardet.universaldetector import UniversalDetector
+   # Examine only the first 10 KB
+   result = chardet.detect(data, max_bytes=10_000)
 
-    detector = UniversalDetector(encoding_era=EncodingEra.ALL)
-    detector.feed(data)
-    detector.close()
-    print(detector.result)
+Smaller values are faster but may reduce accuracy for encodings that
+require more data to distinguish.
 
-If you want to detect the encoding of multiple texts (such as separate
-files), you can re-use a single ``UniversalDetector`` object. Call
-``detector.reset()`` at the start of each file, ``feed`` as many times as
-you like, then ``close()`` and check ``detector.result``.
+Deprecated Parameters
+---------------------
 
-Example: Detecting encodings of multiple files
-----------------------------------------------
+The following parameters are accepted for backward compatibility with
+chardet 5.x/6.x but have no effect:
 
-.. code:: python
+- ``chunk_size`` on :func:`~chardet.detect` and
+  :func:`~chardet.detect_all` — previously controlled how data was
+  chunked for streaming probers. A deprecation warning is emitted if a
+  non-default value is passed.
+- ``lang_filter`` on :class:`~chardet.UniversalDetector` — previously
+  restricted detection to specific language groups via
+  :class:`~chardet.LanguageFilter`. A deprecation warning is emitted if
+  set to anything other than :attr:`~chardet.LanguageFilter.ALL`.
 
-    import glob
-    from chardet.universaldetector import UniversalDetector
-
-    detector = UniversalDetector()
-    for filename in glob.glob('*.xml'):
-        detector.reset()
-        with open(filename, 'rb') as f:
-            for line in f:
-                detector.feed(line)
-                if detector.done:
-                    break
-        detector.close()
-        print(f'{filename}: {detector.result}')
-
-
-Command-line tool
+Command-Line Tool
 -----------------
 
-chardet includes a ``chardetect`` command-line tool:
+chardet includes a ``chardetect`` command:
 
-.. code:: bash
+.. code-block:: bash
 
-    $ chardetect somefile.txt someotherfile.txt
-    somefile.txt: Windows-1252 with confidence 0.73
-    someotherfile.txt: ascii with confidence 1.0
+   # Detect encoding of files
+   chardetect somefile.txt anotherfile.csv
 
-To consider all encoding eras (not just modern web encodings):
+   # Output only the encoding name
+   chardetect --minimal somefile.txt
 
-.. code:: bash
+   # Specific encoding era
+   chardetect -e dos somefile.txt
 
-    $ chardetect -e ALL somefile.txt
-
-Other options:
-
-.. code:: text
-
-    $ chardetect --help
-    usage: chardetect [-h] [--minimal] [-l] [-e ENCODING_ERA] [--version]
-                      [input ...]
-
-    Takes one or more file paths and reports their detected encodings
-
-    positional arguments:
-      input                 File whose encoding we would like to determine.
-                            (default: stdin)
-
-    options:
-      -h, --help            show this help message and exit
-      --minimal             Print only the encoding to standard output
-      -l, --legacy          Rename legacy encodings to more modern ones.
-      -e ENCODING_ERA, --encoding-era ENCODING_ERA
-                            Which era of encodings to consider (default:
-                            MODERN_WEB). Choices: MODERN_WEB, LEGACY_ISO,
-                            LEGACY_MAC, LEGACY_REGIONAL, DOS, MAINFRAME, ALL
-      --version             show program's version number and exit
+   # Read from stdin
+   cat somefile.txt | chardetect
