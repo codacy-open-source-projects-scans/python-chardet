@@ -115,14 +115,19 @@ def main() -> None:
 
     else:
         t0 = time.perf_counter()
-        from charset_normalizer import from_bytes
+        import charset_normalizer
 
         import_time = time.perf_counter() - t0
 
         def detect(data: bytes) -> tuple[str | None, str | None]:
-            r = from_bytes(data)
-            best = r.best()
-            return (best.encoding if best else None), None
+            r = charset_normalizer.detect(data)
+            return r["encoding"], r["language"]
+
+    # Warm-up: first detect() call may trigger lazy initialization.
+    # Time it separately so compare_detectors.py can report it as "1st detect".
+    t_warmup = time.perf_counter()
+    detect(b"Hello, world!")
+    first_detect_time = time.perf_counter() - t_warmup
 
     # Run detection over all files, collect per-file times + results
     file_times: list[float] = []
@@ -150,7 +155,15 @@ def main() -> None:
 
     if args.json_only:
         # Summary line (last)
-        print(json.dumps({"__timing__": total_elapsed, "import_time": import_time}))
+        print(
+            json.dumps(
+                {
+                    "__timing__": total_elapsed,
+                    "import_time": import_time,
+                    "first_detect_time": first_detect_time,
+                }
+            )
+        )
     else:
         # Human-readable summary
         total_ms = sum(file_times) * 1000
@@ -170,6 +183,7 @@ def main() -> None:
         print()
         print("Timing:")
         print(f"  Import:       {import_time:.3f}s")
+        print(f"  1st detect:   {first_detect_time:.3f}s")
         print(f"  Detection:    {total_ms:.0f}ms total")
         print(
             f"  Per-file:     mean={mean_ms:.2f}ms  median={median_ms:.2f}ms"
