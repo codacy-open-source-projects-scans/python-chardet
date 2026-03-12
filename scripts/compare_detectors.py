@@ -93,14 +93,20 @@ def _cache_filename(  # noqa: PLR0913
     python_tag: str,
     build_tag: str,
     kind: str,
+    *,
+    threads: int = 1,
 ) -> str:
     """Build a cache filename like ``chardet_7.0.1_a1b2c3_cpython3.11_mypyc_time.json``.
+
+    When *threads* > 1, a ``{N}threads`` segment is inserted before *kind*:
+    ``chardet_7.0.1_a1b2c3_cpython3.11_mypyc_4threads_time.json``.
 
     *detector_name* should be the package name (e.g. ``"chardet"``,
     ``"charset-normalizer"``), **not** the display label.
     """
     safe_name = detector_name.replace(" ", "-").replace("/", "-")
-    return f"{safe_name}_{detector_version}_{benchmark_hash}_{python_tag}_{build_tag}_{kind}.json"
+    threads_seg = f"_{threads}threads" if threads > 1 else ""
+    return f"{safe_name}_{detector_version}_{benchmark_hash}_{python_tag}_{build_tag}{threads_seg}_{kind}.json"
 
 
 def _load_cached(cache_dir: Path, filename: str) -> dict | None:
@@ -153,8 +159,10 @@ def _get_detector_version(python_executable: str, detector_type: str) -> str:
 def _get_python_tag(python_executable: str) -> str:
     """Return a tag like ``cpython3.11`` or ``pypy3.10`` from the venv Python."""
     script = (
-        "import platform, sys; "
-        "print(f'{platform.python_implementation().lower()}{sys.version_info.major}.{sys.version_info.minor}')"
+        "import platform, sys, sysconfig; "
+        "abi = sysconfig.get_config_var('ABIFLAGS') or ''; "
+        "t = 't' if 't' in abi else ''; "
+        "print(f'{platform.python_implementation().lower()}{sys.version_info.major}.{sys.version_info.minor}{t}')"
     )
     fd, tmp_path = tempfile.mkstemp(suffix=".py")
     tmp = Path(tmp_path)
@@ -329,12 +337,22 @@ def _has_full_cache(  # noqa: PLR0913
     build_tag: str,
     *,
     skip_memory: bool = False,
+    threads: int = 1,
 ) -> bool:
     """Return ``True`` if all required cache files exist."""
     kinds = ("time",) if skip_memory else ("time", "memory")
     for kind in kinds:
+        # Memory benchmarks are always single-threaded; only timing caches
+        # include the thread count.
+        t = threads if kind == "time" else 1
         fname = _cache_filename(
-            detector_type, version, benchmark_hash, python_tag, build_tag, kind
+            detector_type,
+            version,
+            benchmark_hash,
+            python_tag,
+            build_tag,
+            kind,
+            threads=t,
         )
         if not (cache_dir / fname).is_file():
             return False
@@ -406,13 +424,14 @@ def _cleanup_venv(venv_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _run_timing_subprocess(
+def _run_timing_subprocess(  # noqa: PLR0913
     python_executable: str,
     data_dir: str,
     *,
     detector_type: str = "chardet",
     encoding_era: str = "all",
     pure: bool = False,
+    threads: int = 1,
 ) -> _TimingResult:
     """Run detection timing in an isolated subprocess via ``benchmark_time.py``.
 
@@ -428,6 +447,8 @@ def _run_timing_subprocess(
         For ``"chardet"`` only -- ``"all"``, ``"modern_web"``, or ``"none"``.
     pure : bool
         Abort if mypyc .so/.pyd files are found (chardet only).
+    threads : int
+        Number of detection threads to pass to ``benchmark_time.py``.
 
     Returns
     -------
@@ -449,6 +470,8 @@ def _run_timing_subprocess(
     cmd.extend(["--encoding-era", encoding_era])
     if pure:
         cmd.append("--pure")
+    if threads > 1:
+        cmd.extend(["--threads", str(threads)])
 
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
@@ -498,6 +521,7 @@ def _run_timing_with_median(  # noqa: PLR0913
     encoding_era: str = "all",
     pure: bool = False,
     num_runs: int = 3,
+    threads: int = 1,
 ) -> _TimingResult:
     """Run timing ``num_runs`` times and return median-aggregated results.
 
@@ -518,6 +542,7 @@ def _run_timing_with_median(  # noqa: PLR0913
             detector_type=detector_type,
             encoding_era=encoding_era,
             pure=pure,
+            threads=threads,
         )
         if i == 0:
             first_results = run.results
@@ -654,6 +679,7 @@ def run_comparison(  # noqa: PLR0913
     use_cache: bool = True,
     benchmark_hash: str = "",
     no_memory: bool = False,
+    threads: int = 1,
 ) -> None:
     """Run accuracy and performance comparison across detectors.
 
@@ -677,6 +703,8 @@ def run_comparison(  # noqa: PLR0913
         Hash of benchmark source files for cache invalidation.
     no_memory : bool
         Skip memory benchmarks when ``True``.
+    threads : int
+        Number of detection threads to pass to ``benchmark_time.py``.
 
     """
     if detector_versions is None:
@@ -695,6 +723,8 @@ def run_comparison(  # noqa: PLR0913
 
     print(f"Found {len(test_files)} test files")
     print(f"Detectors: {', '.join(detector_labels)}")
+    if threads > 1:
+        print(f"Threads: {threads}")
     print()
     print("Equivalences used:")
     print("  Superset relationships (detected superset of expected is correct):")
@@ -746,7 +776,13 @@ def run_comparison(  # noqa: PLR0913
         # Check cache
         if cache_dir is not None:
             fname = _cache_filename(
-                detector_type, version, benchmark_hash, py_tag, b_tag, "time"
+                detector_type,
+                version,
+                benchmark_hash,
+                py_tag,
+                b_tag,
+                "time",
+                threads=threads,
             )
             cached = _load_cached(cache_dir, fname)
             if cached is not None:
@@ -777,12 +813,19 @@ def run_comparison(  # noqa: PLR0913
             encoding_era=era,
             pure=is_pure,
             num_runs=num_runs,
+            threads=threads,
         )
 
         # Save to cache
         if cache_dir is not None:
             fname = _cache_filename(
-                detector_type, version, benchmark_hash, py_tag, b_tag, "time"
+                detector_type,
+                version,
+                benchmark_hash,
+                py_tag,
+                b_tag,
+                "time",
+                threads=threads,
             )
             _save_cache(
                 cache_dir,
@@ -1203,10 +1246,19 @@ if __name__ == "__main__":
             " (sets HATCH_BUILD_HOOK_ENABLE_MYPYC=true)"
         ),
     )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Number of detection threads for benchmark_time.py (default: 1)",
+    )
     args = parser.parse_args()
 
     if args.pure and args.mypyc:
         parser.error("--pure and --mypyc are mutually exclusive")
+    if args.threads < 1:
+        parser.error("--threads must be >= 1")
 
     # Force line-buffered stdout so progress is visible when piped (e.g. tee).
     sys.stdout.reconfigure(line_buffering=True)
@@ -1222,20 +1274,46 @@ if __name__ == "__main__":
 
     # --pure: strip the mypyc build hook env var so the chardet venv is
     # guaranteed to be pure Python even if the caller has it set.
-    # --mypyc: force HATCH_BUILD_HOOK_ENABLE_MYPYC=true so mypyc extensions
-    # are compiled even if the caller hasn't set the env var.
+    # --mypyc: build a mypyc wheel locally first, then install it.
     install_env: dict[str, str] | None = None
+    mypyc_wheel_dir: Path | None = None
+    chardet_pip_args: list[str] = [project_root]
     if args.pure:
         install_env = {
             k: v for k, v in os.environ.items() if k != "HATCH_BUILD_HOOK_ENABLE_MYPYC"
         }
     elif args.mypyc:
-        install_env = {**os.environ, "HATCH_BUILD_HOOK_ENABLE_MYPYC": "true"}
+        # Build a mypyc-compiled wheel so the venv gets compiled extensions.
+        # Passing HATCH_BUILD_HOOK_ENABLE_MYPYC via env to `uv pip install`
+        # doesn't reliably trigger the build hook, so we build explicitly.
+        mypyc_wheel_dir = Path(tempfile.mkdtemp(prefix="chardet-mypyc-wheel-"))
+        print("Building mypyc wheel for local chardet ...")
+        build_cmd = [
+            "uv",
+            "build",
+            "--wheel",
+            "--out-dir",
+            str(mypyc_wheel_dir),
+            project_root,
+        ]
+        if args.python:
+            build_cmd.extend(["--python", args.python])
+        subprocess.run(
+            build_cmd,
+            check=True,
+            env={**os.environ, "HATCH_BUILD_HOOK_ENABLE_MYPYC": "true"},
+        )
+        wheels = list(mypyc_wheel_dir.glob("*.whl"))
+        if not wheels:
+            print("ERROR: mypyc wheel build produced no .whl file", file=sys.stderr)
+            sys.exit(1)
+        chardet_pip_args = [str(wheels[0])]
+        print(f"  Built: {wheels[0].name}")
 
     # Build venv specs: (label, pip_args, env, detector_type, python_version)
     VenvSpec = tuple[str, list[str], dict[str, str] | None, str, str | None]
     venv_specs: list[VenvSpec] = [
-        ("chardet", [project_root], install_env, "chardet", args.python),
+        ("chardet", chardet_pip_args, install_env, "chardet", args.python),
     ]
 
     venv_specs.extend(
@@ -1305,6 +1383,7 @@ if __name__ == "__main__":
             python_tags[label],
             build_tags[label],
             skip_memory=args.no_memory,
+            threads=args.threads,
         ):
             print(f"  {label}: full cache hit, skipping venv creation")
         else:
@@ -1408,8 +1487,11 @@ if __name__ == "__main__":
             use_cache=use_cache,
             benchmark_hash=benchmark_hash,
             no_memory=args.no_memory,
+            threads=args.threads,
         )
     finally:
         for label, (venv_dir, _) in venvs.items():
             print(f"  Cleaning up venv for {label} ...")
             _cleanup_venv(venv_dir)
+        if mypyc_wheel_dir is not None:
+            shutil.rmtree(mypyc_wheel_dir, ignore_errors=True)

@@ -1,6 +1,9 @@
 # tests/test_markup.py
 from __future__ import annotations
 
+import re
+from unittest.mock import patch
+
 from chardet.pipeline.markup import detect_markup_charset
 
 
@@ -8,7 +11,7 @@ def test_xml_encoding_declaration():
     data = b'<?xml version="1.0" encoding="iso-8859-1"?><root/>'
     result = detect_markup_charset(data)
     assert result is not None
-    assert result.encoding == "ISO-8859-1"
+    assert result.encoding == "iso8859-1"
     assert result.confidence < 1.0
 
 
@@ -16,7 +19,7 @@ def test_html5_meta_charset():
     data = b'<html><head><meta charset="utf-8"></head></html>'
     result = detect_markup_charset(data)
     assert result is not None
-    assert result.encoding == "UTF-8"
+    assert result.encoding == "utf-8"
 
 
 def test_html4_content_type():
@@ -27,7 +30,7 @@ def test_html4_content_type():
     )
     result = detect_markup_charset(data)
     assert result is not None
-    assert result.encoding == "Windows-1252"
+    assert result.encoding == "cp1252"
 
 
 def test_no_markup():
@@ -44,21 +47,21 @@ def test_xml_single_quotes():
     data = b"<?xml version='1.0' encoding='shift_jis'?><root/>"
     result = detect_markup_charset(data)
     assert result is not None
-    assert result.encoding == "Shift-JIS-2004"
+    assert result.encoding == "shift_jis_2004"
 
 
 def test_case_insensitive_meta():
     data = b'<META CHARSET="UTF-8">'
     result = detect_markup_charset(data)
     assert result is not None
-    assert result.encoding == "UTF-8"
+    assert result.encoding == "utf-8"
 
 
 def test_charset_with_whitespace():
     data = b'<meta charset = "utf-8" >'
     result = detect_markup_charset(data)
     assert result is not None
-    assert result.encoding == "UTF-8"
+    assert result.encoding == "utf-8"
 
 
 def test_unknown_encoding_returns_none():
@@ -79,7 +82,7 @@ def test_valid_charset_declaration_accepted():
     data = b'<meta charset="shift_jis">' + "日本語テスト".encode("shift_jis")
     result = detect_markup_charset(data)
     assert result is not None
-    assert result.encoding == "Shift-JIS-2004"
+    assert result.encoding == "shift_jis_2004"
 
 
 def test_charset_within_scan_limit_found():
@@ -87,7 +90,7 @@ def test_charset_within_scan_limit_found():
     data = padding + b'<meta charset="utf-8">'
     result = detect_markup_charset(data)
     assert result is not None
-    assert result.encoding == "UTF-8"
+    assert result.encoding == "utf-8"
 
 
 def test_charset_beyond_scan_limit_ignored():
@@ -102,4 +105,15 @@ def test_non_ascii_charset_name_ignored():
     # Build a meta tag whose charset value contains a non-ASCII byte (0xff)
     data = b'<meta charset="' + b"\xff\xfe" + b'">'
     result = detect_markup_charset(data)
+    assert result is None
+
+
+def test_pep263_non_ascii_coding_name():
+    """PEP 263 coding name with non-ASCII bytes should return None."""
+    # The default PEP263 regex only captures ASCII via \\w on bytes, so
+    # swap in a broader regex that can capture high bytes.
+    broad_re = re.compile(rb"^[ \t\f]*#.*?coding[:=][ \t]*([^\s]+)", re.MULTILINE)
+    data = b"# -*- coding: \xff\xfe -*-\n"
+    with patch("chardet.pipeline.markup._PEP263_RE", broad_re):
+        result = detect_markup_charset(data)
     assert result is None

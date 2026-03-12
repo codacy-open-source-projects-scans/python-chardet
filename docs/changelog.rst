@@ -1,8 +1,19 @@
 Changelog
 =========
 
-7.0.2 (2026-03-09)
+7.1.0 (2026-03-11)
 -------------------
+
+**Features:**
+
+- Added PEP 263 encoding declaration detection — ``# -*- coding: ... -*-``
+  and ``# coding=...`` declarations on lines 1–2 of Python source files are
+  now recognized with confidence 0.95 (`#249
+  <https://github.com/chardet/chardet/issues/249>`_)
+- Added ``chardet.universaldetector`` backward-compatibility stub so that
+  ``from chardet.universaldetector import UniversalDetector`` works with a
+  deprecation warning (`#341
+  <https://github.com/chardet/chardet/issues/341>`_)
 
 **Fixes:**
 
@@ -14,6 +25,8 @@ Changelog
 - Fixed undocumented encoding name changes between chardet 5.x and 7.0 —
   ``detect()`` now returns chardet 5.x-compatible names by default (`#338
   <https://github.com/chardet/chardet/issues/338>`_)
+- Improved ISO-2022-JP family detection — recognizes ESC sequences for
+  ISO-2022-JP-2004 (JIS X 0213) and ISO-2022-JP-EXT (JIS X 0201 Kana)
 - Fixed silent truncation of corrupt model data (``iter_unpack`` yielded
   fewer tuples instead of raising)
 - Fixed incorrect date in LICENSE
@@ -25,18 +38,29 @@ Changelog
 - ~40% faster model parsing via ``struct.iter_unpack`` for bulk entry
   extraction (eliminates ~305K individual ``unpack`` calls)
 
+**New API parameters:**
+
+- Added ``compat_names`` parameter (default ``True``) to
+  :func:`~chardet.detect`, :func:`~chardet.detect_all`, and
+  :class:`~chardet.UniversalDetector` — set to ``False`` to get raw Python
+  codec names instead of chardet 5.x/6.x compatible display names
+- Added ``prefer_superset`` parameter (default ``False``) — remaps legacy
+  ISO/subset encodings to their modern Windows/CP superset equivalents
+  (e.g., ASCII → Windows-1252, ISO-8859-1 → Windows-1252).
+  **This will default to ``True`` in the next major version (8.0).**
+- Deprecated ``should_rename_legacy`` in favor of ``prefer_superset`` —
+  a deprecation warning is emitted when used
+
 **Improvements:**
 
-- Unified all internal encoding names to a single canonical display-cased
-  convention (e.g., ``"UTF-8"``, ``"Windows-1252"``, ``"ISO-8859-1"``).
-  The ``should_rename_legacy`` parameter controls output names: ``False``
-  (default) returns chardet 5.x-compatible names, ``True`` applies
-  canonical names with ISO→Windows superset remapping. See
-  :doc:`usage` for the full mapping table.
+- Switched internal canonical encoding names to Python codec names
+  (e.g., ``"utf-8"`` instead of ``"UTF-8"``), with ``compat_names``
+  controlling the public output format.  See :doc:`usage` for the full
+  mapping table.
 - Added ``lookup_encoding()`` to ``registry`` for case-insensitive
   resolution of arbitrary encoding name input to canonical names
 - Achieved 100% line coverage across all source modules (+31 tests)
-- Updated benchmark numbers: 98.0% encoding accuracy, 95.2% language
+- Updated benchmark numbers: 98.2% encoding accuracy, 95.2% language
   accuracy on 2,510 test files
 - Pinned test-data cloning to chardet release version tags for
   reproducible builds

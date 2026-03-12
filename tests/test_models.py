@@ -19,10 +19,10 @@ from chardet.models import (
 def test_enc_index_resolves_aliases() -> None:
     index = get_enc_index()
     # Models keyed by old names should be accessible under new primary names
-    assert "Big5-HKSCS" in index
-    assert "EUC-JIS-2004" in index
-    assert "Shift-JIS-2004" in index
-    assert "CP1140" in index
+    assert "big5hkscs" in index
+    assert "euc_jis_2004" in index
+    assert "shift_jis_2004" in index
+    assert "cp1140" in index
 
 
 def test_load_models_returns_dict() -> None:
@@ -123,11 +123,11 @@ def test_bigram_profile_high_byte_weight() -> None:
 
 
 @pytest.fixture
-def tmp_models_path(tmp_path: Path) -> str:
-    return str(tmp_path / "test_models.bin")
+def tmp_models_path(tmp_path: Path) -> Path:
+    return tmp_path / "test_models.bin"
 
 
-def test_roundtrip_single_encoding(tmp_models_path: str) -> None:
+def test_roundtrip_single_encoding(tmp_models_path: Path) -> None:
     """Serialize and deserialize a single encoding model."""
     original = {"utf-8": {(65, 66): 200, (0xC3, 0xA4): 150}}
     serialize_models(original, tmp_models_path)
@@ -135,7 +135,7 @@ def test_roundtrip_single_encoding(tmp_models_path: str) -> None:
     assert loaded == original
 
 
-def test_roundtrip_multiple_encodings(tmp_models_path: str) -> None:
+def test_roundtrip_multiple_encodings(tmp_models_path: Path) -> None:
     """Serialize and deserialize multiple encoding models."""
     original = {
         "utf-8": {(65, 66): 200, (67, 68): 100},
@@ -147,7 +147,7 @@ def test_roundtrip_multiple_encodings(tmp_models_path: str) -> None:
     assert loaded == original
 
 
-def test_roundtrip_empty_bigrams(tmp_models_path: str) -> None:
+def test_roundtrip_empty_bigrams(tmp_models_path: Path) -> None:
     """An encoding with zero bigrams should roundtrip correctly."""
     original = {"empty-enc": {}}
     serialize_models(original, tmp_models_path)
@@ -155,7 +155,7 @@ def test_roundtrip_empty_bigrams(tmp_models_path: str) -> None:
     assert loaded == original
 
 
-def test_roundtrip_zero_encodings(tmp_models_path: str) -> None:
+def test_roundtrip_zero_encodings(tmp_models_path: Path) -> None:
     """Zero encodings should roundtrip correctly."""
     original: dict[str, dict[tuple[int, int], int]] = {}
     serialize_models(original, tmp_models_path)
@@ -165,24 +165,23 @@ def test_roundtrip_zero_encodings(tmp_models_path: str) -> None:
 
 def test_deserialize_missing_file() -> None:
     """Missing file should return empty dict."""
-    result = deserialize_models("/nonexistent/path/models.bin")
+    result = deserialize_models(Path("/nonexistent/path/models.bin"))
     assert result == {}
 
 
-def test_deserialize_empty_file(tmp_models_path: str) -> None:
+def test_deserialize_empty_file(tmp_models_path: Path) -> None:
     """Empty file should return empty dict."""
-    Path(tmp_models_path).write_bytes(b"")
+    tmp_models_path.write_bytes(b"")
     result = deserialize_models(tmp_models_path)
     assert result == {}
 
 
-def test_deserialize_trailing_bytes_raises(tmp_models_path: str) -> None:
+def test_deserialize_trailing_bytes_raises(tmp_models_path: Path) -> None:
     """File with trailing bytes after valid data should raise ValueError."""
     original = {"utf-8": {(65, 66): 200}}
     serialize_models(original, tmp_models_path)
     # Append garbage bytes
-    p = Path(tmp_models_path)
-    p.write_bytes(p.read_bytes() + b"\xff\xff")
+    tmp_models_path.write_bytes(tmp_models_path.read_bytes() + b"\xff\xff")
     with pytest.raises(ValueError, match="trailing bytes"):
         deserialize_models(tmp_models_path)
 
@@ -198,7 +197,7 @@ def test_roundtrip_matches_load_models(tmp_path: Path) -> None:
             if table[idx] > 0:
                 bigrams[(idx >> 8, idx & 0xFF)] = table[idx]
         production_dicts[name] = bigrams
-    tmp_models = str(tmp_path / "roundtrip_models.bin")
+    tmp_models = tmp_path / "roundtrip_models.bin"
     serialize_models(production_dicts, tmp_models)
     loaded = deserialize_models(tmp_models)
     assert loaded == production_dicts
@@ -209,14 +208,11 @@ def mock_models_bin():
     """Clear the model cache and provide a helper to mock models.bin content.
 
     Yields a callable ``set_data(raw_bytes)`` that configures the mock to
-    return *raw_bytes* from ``models.bin``.  The original ``_MODEL_CACHE``
-    and ``_MODEL_NORMS`` are restored on teardown.
+    return *raw_bytes* from ``models.bin``.  The cache is cleared on teardown.
     """
     import chardet.models as mod
 
-    original_cache = mod._MODEL_CACHE
-    original_norms = mod._MODEL_NORMS
-    mod._MODEL_CACHE = None
+    mod._load_models_data.cache_clear()
     mock_ref = MagicMock()
 
     def set_data(data: bytes) -> None:
@@ -229,8 +225,7 @@ def mock_models_bin():
     ):
         yield set_data
 
-    mod._MODEL_CACHE = original_cache
-    mod._MODEL_NORMS = original_norms
+    mod._load_models_data.cache_clear()
 
 
 def test_load_models_empty_file(mock_models_bin: Callable[[bytes], None]) -> None:
@@ -331,30 +326,25 @@ def test_score_with_profile_all_zeros_model():
     assert score == 0.0
 
 
-def test_enc_index_alias_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_enc_index_alias_resolution() -> None:
     """When a model key uses a non-canonical name, the canonical name is added.
 
     The index should contain both the original key and the canonical name
     pointing to the same entries.
     """
-    import chardet.models as mod
-
-    # Reset the index cache so get_enc_index() rebuilds it
-    monkeypatch.setattr(mod, "_ENC_INDEX", None)
+    from chardet.models import _build_enc_index
 
     # Create a fake model dict with a non-canonical encoding name.
-    # "utf8" is a non-canonical alias for "UTF-8".
+    # "utf8" is a non-canonical alias for "utf-8".
     fake_model = bytearray(65536)
     fake_model[(0xC3 << 8) | 0xA9] = 100
     fake_models = {"French/utf8": fake_model}
 
-    monkeypatch.setattr(mod, "load_models", lambda: fake_models)
-
-    index = mod.get_enc_index()
+    index = _build_enc_index(fake_models)
 
     # The non-canonical key "utf8" should be in the index
     assert "utf8" in index
-    # The canonical name "UTF-8" should also be present via alias resolution
-    assert "UTF-8" in index
+    # The canonical name "utf-8" should also be present via alias resolution
+    assert "utf-8" in index
     # Both should point to the same entries
-    assert index["UTF-8"] is index["utf8"]
+    assert index["utf-8"] is index["utf8"]
