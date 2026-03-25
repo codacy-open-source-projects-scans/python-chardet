@@ -6,27 +6,28 @@ Universal character encoding detector.
 [![Documentation](https://readthedocs.org/projects/chardet/badge/?version=latest)](https://chardet.readthedocs.io)
 [![codecov](https://codecov.io/github/chardet/chardet/branch/main/graph/badge.svg?token=m5ZQrMd3vk)](https://codecov.io/github/chardet/chardet)
 
-chardet 7.0 is a ground-up, 0BSD-licensed rewrite of [chardet](https://github.com/chardet/chardet).
+chardet 7 is a ground-up, 0BSD-licensed rewrite of [chardet](https://github.com/chardet/chardet).
 Same package name, same public API — drop-in replacement for chardet 5.x/6.x, just much faster and more accurate.
 Python 3.10+, zero runtime dependencies, works on PyPy.
 
-## Why chardet 7.0?
+## Why chardet 7?
 
-**98.2% accuracy** on 2,510 test files. **44x faster** than chardet 6.0.0
-and **4.1x faster** than
-charset-normalizer. **Language
-detection** for every result. **0BSD licensed.**
+**98.6% accuracy** on 2,518 test files. **44x faster** than chardet 6.0.0
+and **1.4x faster** than charset-normalizer. **Language detection** for
+every result. **MIME type detection** for binary files. **0BSD licensed.**
 
-|                        | chardet 7.1.0 (mypyc) | chardet 7.1.0 (pure) | chardet 6.0.0 | [charset-normalizer] |
-| ---------------------- | :--------------------: | :------------------: | :-----------: | :------------------: |
-| Accuracy (2,510 files) |       **98.2%**        |      **98.2%**       |     88.3%     |        84.2%         |
-| Speed                  |    **533 files/s**     |   **372 files/s**    |  12 files/s   |     129 files/s      |
-| Language detection     |       **95.2%**        |      **95.2%**       |     40.0%     |        59.0%         |
-| Peak memory            |     **25.9 MiB**       |    **25.9 MiB**      |   29.5 MiB    |      101.3 MiB       |
-| Streaming detection    |        **yes**         |       **yes**        |      yes      |          no          |
-| Encoding era filtering |        **yes**         |       **yes**        |      no       |          no          |
-| Supported encodings    |          99            |         99           |      84       |          99          |
-| License                |          0BSD          |         0BSD         |     LGPL      |         MIT          |
+|                        | chardet 7.3.0 (mypyc) | chardet 6.0.0 | [charset-normalizer] 3.4.6 |
+| ---------------------- | :--------------------: | :-----------: | :-------------------------: |
+| Accuracy (2,518 files) |       **98.6%**        |     88.2%     |            85.3%            |
+| Speed                  |    **512 files/s**     |  12 files/s   |         363 files/s         |
+| Language detection     |       **95.9%**        |     40.0%     |            59.2%            |
+| Peak memory            |     **25.9 MiB**       |   29.5 MiB    |          101.3 MiB          |
+| Streaming detection    |        **yes**         |      yes      |             no              |
+| Encoding era filtering |        **yes**         |      no       |             no              |
+| Encoding filters       |        **yes**         |      no       |             no              |
+| MIME type detection    |        **yes**         |      no       |             no              |
+| Supported encodings    |          99            |      84       |             99              |
+| License                |          0BSD          |     LGPL      |            MIT              |
 
 [charset-normalizer]: https://github.com/jawah/charset_normalizer
 
@@ -42,15 +43,15 @@ pip install chardet
 import chardet
 
 chardet.detect(b"Hello, world!")
-# {'encoding': 'ascii', 'confidence': 1.0, 'language': 'en'}
+# {'encoding': 'ascii', 'confidence': 1.0, 'language': 'en', 'mime_type': 'text/plain'}
 
 # UTF-8 with typographic punctuation
 chardet.detect("It\u2019s a lovely day \u2014 let\u2019s grab coffee.".encode("utf-8"))
-# {'encoding': 'utf-8', 'confidence': 0.99, 'language': 'es'}
+# {'encoding': 'utf-8', 'confidence': 0.99, 'language': 'es', 'mime_type': 'text/plain'}
 
 # Japanese EUC-JP
 chardet.detect("これは日本語のテストです。文字コードの検出を行います。".encode("euc-jp"))
-# {'encoding': 'EUC-JP', 'confidence': 1.0, 'language': 'ja'}
+# {'encoding': 'EUC-JP', 'confidence': 1.0, 'language': 'ja', 'mime_type': 'text/plain'}
 
 # Get all candidate encodings ranked by confidence
 text = "Le café est une boisson très populaire en France et dans le monde entier."
@@ -138,16 +139,17 @@ cat somefile.txt | chardetect
 # stdin: utf-8 with confidence 0.99
 ```
 
-## What's New in 7.0
+## What's New in chardet 7?
 
 - **0BSD license** (previous versions were LGPL)
-- **Ground-up rewrite** — 12-stage detection pipeline using BOM detection, structural probing, byte validity filtering, and bigram statistical models
-- **42x faster** than chardet 6.0.0 with mypyc (**34x** pure Python), **4.2x faster** than charset-normalizer
-- **98.2% accuracy** — +10.0pp vs chardet 6.0.0, +14.0pp vs charset-normalizer
-- **Language detection** — 95.2% accuracy across 49 languages, returned with every result
+- **Ground-up rewrite** — 13-stage detection pipeline using BOM detection, magic number identification, structural probing, byte validity filtering, and bigram statistical models
+- **44x faster** than chardet 6.0.0 with mypyc, **1.4x faster** than charset-normalizer
+- **98.6% accuracy** — +10.4pp vs chardet 6.0.0, +13.3pp vs charset-normalizer
+- **Language detection** — 95.9% accuracy across 49 languages, returned with every result
+- **MIME type detection** — identifies 40+ binary file formats (images, audio/video, archives, documents, executables, fonts) via magic number signatures, plus `text/html`, `text/xml`, and `text/x-python` for markup
+- **Encoding filters** — `include_encodings` and `exclude_encodings` parameters to restrict or exclude specific encodings from the candidate set
 - **99 encodings** — full coverage including EBCDIC, Mac, DOS, and Baltic/Central European families
-- **`EncodingEra` filtering** — scope detection to modern web encodings, legacy ISO/Mac/DOS, mainframe, or all
-- **Optional mypyc compilation** — 1.42x additional speedup on CPython
+- **Optional mypyc compilation** — 1.31x additional speedup on CPython
 - **Thread-safe** — `detect()` and `detect_all()` are safe to call concurrently; scales on free-threaded Python
 - **Same API** — `detect()`, `detect_all()`, `UniversalDetector`, and the `chardetect` CLI all work as before
 

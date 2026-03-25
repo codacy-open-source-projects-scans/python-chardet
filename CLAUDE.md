@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Versioning
 
-Version is derived from git tags via `hatch-vcs`. The tag is the single source of truth — no hardcoded version strings. At tag `v7.0.0` the version is `7.0.0`; between tags it's auto-incremented (e.g., `7.0.1.dev3+g...`). The generated `src/chardet/_version.py` is gitignored and should never be committed.
+Version is derived from git tags via `hatch-vcs`. The tag is the single source of truth — no hardcoded version strings. Tags do **not** use a `v` prefix: the tag for version 7.3.0 is `7.3.0`, not `v7.3.0`. At tag `7.0.0` the version is `7.0.0`; between tags it's auto-incremented (e.g., `7.0.1.dev3+g...`). The generated `src/chardet/_version.py` is gitignored and should never be committed.
 
 When releasing `X.Y.Z`, also tag the `chardet/test-data` repo with `X.Y.Z` at its current `main` HEAD. The accuracy test suite clones test-data at the matching version tag for release builds, falling back to `main` for dev builds. This ensures `test_accuracy.py` continues to pass for released versions even after test-data is updated.
 
@@ -44,10 +44,14 @@ uv run ruff format .       # format
 ### Training Models
 
 ```bash
-uv run python scripts/train.py   # retrain bigram models from CulturaX/HTML data
+uv run python scripts/train.py   # retrain bigram models from CulturaX/MADLAD-400/Wikipedia data
+uv run python scripts/verify_no_overlap.py  # verify no train/test data overlap
 ```
 
-Training data is cached in `data/` (gitignored). Models are saved to `src/chardet/models/models.bin`.
+Training data is cached in `data/` (gitignored) under `data/culturax/`,
+`data/madlad400/`, and `data/wikipedia/` per language. Models are saved to
+`src/chardet/models/models.bin`. Test data articles are automatically excluded
+from training via content fingerprinting to prevent train/test overlap.
 
 ### Benchmarks & Diagnostics
 
