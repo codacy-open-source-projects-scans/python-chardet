@@ -25,13 +25,13 @@ import concurrent.futures
 
 # Ensure progress output is visible when piped through tee.
 import functools
+import itertools
 import os
-import re
+import pickle
 import shutil
 import signal
 import struct
 import time
-import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -47,6 +47,7 @@ from data_sources import (
 )
 from data_sources import get_texts as get_texts_multi
 from exclusions import build_exclusion_set
+from substitutions import apply_substitutions, get_substitutions, normalize_text
 
 from chardet.registry import REGISTRY
 
@@ -68,247 +69,14 @@ _ALL_LANGS = sorted({lang for enc in REGISTRY.values() for lang in enc.languages
 ENCODING_LANG_MAP["utf-8"] = _ALL_LANGS
 
 
-# ---------------------------------------------------------------------------
-# Legacy encoding substitutions
-# ---------------------------------------------------------------------------
-
-# Universal substitutions for all single-byte encodings: replace modern
-# typographic punctuation with ASCII equivalents that would have been used
-# historically in legacy encodings.
-_UNIVERSAL_SUBSTITUTIONS: dict[str, str] = {
-    # Dashes
-    "\u2010": "-",  # HYPHEN
-    "\u2011": "-",  # NON-BREAKING HYPHEN
-    "\u2012": "-",  # FIGURE DASH
-    "\u2013": "-",  # EN DASH
-    "\u2014": "-",  # EM DASH
-    "\u2015": "-",  # HORIZONTAL BAR
-    # Quotes
-    "\u2018": "'",  # LEFT SINGLE QUOTATION MARK
-    "\u2019": "'",  # RIGHT SINGLE QUOTATION MARK
-    "\u201a": "'",  # SINGLE LOW-9 QUOTATION MARK
-    "\u201b": "'",  # SINGLE HIGH-REVERSED-9 QUOTATION MARK
-    "\u201c": '"',  # LEFT DOUBLE QUOTATION MARK
-    "\u201d": '"',  # RIGHT DOUBLE QUOTATION MARK
-    "\u201e": '"',  # DOUBLE LOW-9 QUOTATION MARK
-    "\u201f": '"',  # DOUBLE HIGH-REVERSED-9 QUOTATION MARK
-    # Ellipsis
-    "\u2026": "...",  # HORIZONTAL ELLIPSIS
-    # Spaces
-    "\u00a0": " ",  # NO-BREAK SPACE
-    "\u2002": " ",  # EN SPACE
-    "\u2003": " ",  # EM SPACE
-    "\u2009": " ",  # THIN SPACE
-    "\u200a": " ",  # HAIR SPACE
-    # Other common punctuation
-    "\u2022": "*",  # BULLET
-    "\u2032": "'",  # PRIME
-    "\u2033": '"',  # DOUBLE PRIME
-    "\u2212": "-",  # MINUS SIGN
-    # Zero-width and formatting characters (remove)
-    "\u200b": "",  # ZERO WIDTH SPACE
-    "\u200c": "",  # ZERO WIDTH NON-JOINER
-    "\u200d": "",  # ZERO WIDTH JOINER
-    "\u200e": "",  # LEFT-TO-RIGHT MARK
-    "\u200f": "",  # RIGHT-TO-LEFT MARK
-    "\ufeff": "",  # ZERO WIDTH NO-BREAK SPACE (BOM)
-}
-
-# Arabic-specific substitutions for limited code pages
-_ARABIC_SUBSTITUTIONS: dict[str, str] = {
-    "\u060c": ",",  # ARABIC COMMA
-    "\u061b": ";",  # ARABIC SEMICOLON
-    "\u066a": "%",  # ARABIC PERCENT SIGN
-}
-
-# CP866: Belarusian/Ukrainian workaround — historical substitution
-_CP866_SUBSTITUTIONS: dict[str, str] = {
-    "\u0456": "\u0438",  # і → и (Ukrainian/Belarusian I → Russian I)
-    "\u0406": "\u0418",  # І → И (uppercase)
-}
-
-# Romanian: comma-below → cedilla for encodings without modern forms
-_ROMANIAN_CEDILLA_SUBSTITUTIONS: dict[str, str] = {
-    "\u021b": "\u0163",  # ț → ţ (comma-below → cedilla)
-    "\u0219": "\u015f",  # ș → ş (comma-below → cedilla)
-    "\u021a": "\u0162",  # Ț → Ţ (uppercase)
-    "\u0218": "\u015e",  # Ș → Ş (uppercase)
-}
-
-# Vietnamese: Windows-1258 uses base letters + combining tone marks rather
-# than precomposed characters.
-_VIETNAMESE_DECOMPOSITION: dict[str, str] = {
-    # Regular vowels + tones
-    "à": "a\u0300",
-    "á": "a\u0301",
-    "ả": "a\u0309",
-    "ã": "a\u0303",
-    "ạ": "a\u0323",
-    "è": "e\u0300",
-    "é": "e\u0301",
-    "ẻ": "e\u0309",
-    "ẽ": "e\u0303",
-    "ẹ": "e\u0323",
-    "ì": "i\u0300",
-    "í": "i\u0301",
-    "ỉ": "i\u0309",
-    "ĩ": "i\u0303",
-    "ị": "i\u0323",
-    "ò": "o\u0300",
-    "ó": "o\u0301",
-    "ỏ": "o\u0309",
-    "õ": "o\u0303",
-    "ọ": "o\u0323",
-    "ù": "u\u0300",
-    "ú": "u\u0301",
-    "ủ": "u\u0309",
-    "ũ": "u\u0303",
-    "ụ": "u\u0323",
-    "ỳ": "y\u0300",
-    "ý": "y\u0301",
-    "ỷ": "y\u0309",
-    "ỹ": "y\u0303",
-    "ỵ": "y\u0323",
-    # â (circumflex) + tones
-    "ấ": "â\u0301",
-    "ầ": "â\u0300",
-    "ẩ": "â\u0309",
-    "ẫ": "â\u0303",
-    "ậ": "â\u0323",
-    # ê (circumflex) + tones
-    "ế": "ê\u0301",
-    "ề": "ê\u0300",
-    "ể": "ê\u0309",
-    "ễ": "ê\u0303",
-    "ệ": "ê\u0323",
-    # ô (circumflex) + tones
-    "ố": "ô\u0301",
-    "ồ": "ô\u0300",
-    "ổ": "ô\u0309",
-    "ỗ": "ô\u0303",
-    "ộ": "ô\u0323",
-    # ă (breve) + tones
-    "ắ": "ă\u0301",
-    "ằ": "ă\u0300",
-    "ẳ": "ă\u0309",
-    "ẵ": "ă\u0303",
-    "ặ": "ă\u0323",
-    # ơ (horn) + tones
-    "ớ": "ơ\u0301",
-    "ờ": "ơ\u0300",
-    "ở": "ơ\u0309",
-    "ỡ": "ơ\u0303",
-    "ợ": "ơ\u0323",
-    # ư (horn) + tones
-    "ứ": "ư\u0301",
-    "ừ": "ư\u0300",
-    "ử": "ư\u0309",
-    "ữ": "ư\u0303",
-    "ự": "ư\u0323",
-    # Uppercase variants
-    "À": "A\u0300",
-    "Á": "A\u0301",
-    "Ả": "A\u0309",
-    "Ã": "A\u0303",
-    "Ạ": "A\u0323",
-    "È": "E\u0300",
-    "É": "E\u0301",
-    "Ẻ": "E\u0309",
-    "Ẽ": "E\u0303",
-    "Ẹ": "E\u0323",
-    "Ì": "I\u0300",
-    "Í": "I\u0301",
-    "Ỉ": "I\u0309",
-    "Ĩ": "I\u0303",
-    "Ị": "I\u0323",
-    "Ò": "O\u0300",
-    "Ó": "O\u0301",
-    "Ỏ": "O\u0309",
-    "Õ": "O\u0303",
-    "Ọ": "O\u0323",
-    "Ù": "U\u0300",
-    "Ú": "U\u0301",
-    "Ủ": "U\u0309",
-    "Ũ": "U\u0303",
-    "Ụ": "U\u0323",
-    "Ỳ": "Y\u0300",
-    "Ý": "Y\u0301",
-    "Ỷ": "Y\u0309",
-    "Ỹ": "Y\u0303",
-    "Ỵ": "Y\u0323",
-    "Ấ": "Â\u0301",
-    "Ầ": "Â\u0300",
-    "Ẩ": "Â\u0309",
-    "Ẫ": "Â\u0303",
-    "Ậ": "Â\u0323",
-    "Ế": "Ê\u0301",
-    "Ề": "Ê\u0300",
-    "Ể": "Ê\u0309",
-    "Ễ": "Ê\u0303",
-    "Ệ": "Ê\u0323",
-    "Ố": "Ô\u0301",
-    "Ồ": "Ô\u0300",
-    "Ổ": "Ô\u0309",
-    "Ỗ": "Ô\u0303",
-    "Ộ": "Ô\u0323",
-    "Ắ": "Ă\u0301",
-    "Ằ": "Ă\u0300",
-    "Ẳ": "Ă\u0309",
-    "Ẵ": "Ă\u0303",
-    "Ặ": "Ă\u0323",
-    "Ớ": "Ơ\u0301",
-    "Ờ": "Ơ\u0300",
-    "Ở": "Ơ\u0309",
-    "Ỡ": "Ơ\u0303",
-    "Ợ": "Ơ\u0323",
-    "Ứ": "Ư\u0301",
-    "Ừ": "Ư\u0300",
-    "Ử": "Ư\u0309",
-    "Ữ": "Ư\u0303",
-    "Ự": "Ư\u0323",
-}
-
-
-def get_substitutions(charset_name: str, langs: list[str]) -> dict[str, str]:
-    """Build the character substitution table for a given encoding."""
-    subs = dict(_UNIVERSAL_SUBSTITUTIONS)
-
-    upper = charset_name.upper()
-    if upper in ("CP720", "CP864", "ISO-8859-6"):
-        subs.update(_ARABIC_SUBSTITUTIONS)
-    if upper == "CP866":
-        subs.update(_CP866_SUBSTITUTIONS)
-    # Romanian comma-below → cedilla for all encodings except ISO-8859-16
-    if "ro" in langs and upper != "ISO-8859-16":
-        subs.update(_ROMANIAN_CEDILLA_SUBSTITUTIONS)
-
-    return subs
-
-
-def normalize_text(text: str, charset_name: str) -> str:
-    """Clean and normalize text for encoding into a legacy charset."""
-    # Collapse repeated whitespace
-    text = re.sub(r"(\s)\1+", r"\1", text)
-    # Vietnamese decomposition for Windows-1258
-    if charset_name.upper() == "WINDOWS-1258":
-        nfc = unicodedata.normalize("NFC", text)
-        text = "".join(_VIETNAMESE_DECOMPOSITION.get(c, c) for c in nfc)
-    return text
-
-
-def apply_substitutions(text: str, subs: dict[str, str]) -> str:
-    """Apply character substitutions to make text encodable in legacy charsets."""
-    for old, new in subs.items():
-        if old in text:
-            text = text.replace(old, new)
-    return text
-
-
 def encode_text(text: str, codec_name: str) -> bytes | None:
-    """Encode text into the target encoding, skipping unencodable characters."""
+    """Encode text into the target encoding.
+
+    Unencodable characters are silently dropped.  This is appropriate for the
+    ASCII-normalized form where substitutions have already handled most
+    characters.
+    """
     try:
-        # Use 'ignore' for characters that still can't be encoded after
-        # substitution — these are genuinely outside the charset's repertoire
         result = text.encode(codec_name, errors="ignore")
         return result if len(result) > 10 else None
     except (LookupError, UnicodeEncodeError, UnicodeDecodeError):
@@ -348,8 +116,8 @@ def compute_bigram_frequencies(
     """Count byte bigram frequencies across all samples."""
     counts: dict[tuple[int, int], int] = collections.Counter()
     for data in encoded_samples:
-        for i in range(len(data) - 1):
-            counts[(data[i], data[i + 1])] += 1
+        for b1, b2 in itertools.pairwise(data):
+            counts[(b1, b2)] += 1
     return dict(counts)
 
 
@@ -357,7 +125,15 @@ def normalize_and_prune(
     freqs: dict[tuple[int, int], int],
     min_weight: int,
 ) -> dict[tuple[int, int], int]:
-    """Normalize frequency counts to 0-255 and prune low weights."""
+    """Normalize frequency counts to 0-255 and prune low weights.
+
+    High-byte bigrams (at least one byte >= 0x80) with raw count >= 300 are
+    preserved at minimum weight 1 even when global normalization rounds them
+    to 0.  A count of 300 across ~15K training articles indicates a real
+    language pattern, not noise.  This recovers encoding-diagnostic signal
+    that global normalization crushes because ASCII bigrams dominate by
+    orders of magnitude.
+    """
     if not freqs:
         return {}
 
@@ -370,6 +146,8 @@ def normalize_and_prune(
         weight = int(round(count / max_count * 255))
         if weight >= min_weight:
             result[pair] = weight
+        elif (pair[0] >= 0x80 or pair[1] >= 0x80) and count >= 300:
+            result[pair] = 1
     return result
 
 
@@ -456,14 +234,17 @@ def verify_codec(codec_name: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _count_cached_texts(cache_dir: Path, lang: str) -> int:
-    """Count the number of cached text files for a language across all sources."""
+def _count_cached_texts(cache_dir: Path, lang: str, max_samples: int) -> int:
+    """Count the number of cached text files for a language across all sources.
+
+    Capped at *max_samples* to reflect what training actually uses.
+    """
     total = 0
     for source in ("culturax", "madlad400", "wikipedia"):
         d = cache_dir / source / lang
         if d.is_dir():
             total += sum(1 for f in d.iterdir() if f.suffix == ".txt")
-    return total
+    return min(total, max_samples)
 
 
 def _write_training_metadata(
@@ -497,7 +278,7 @@ def _write_training_metadata(
             lang = "unknown"
             encoding = parts[0]
 
-        samples_used = _count_cached_texts(cache_dir, lang)
+        samples_used = _count_cached_texts(cache_dir, lang, max_samples)
 
         lines.append(f"  {model_key}:")
         lines.append(f"    language: {lang}")
@@ -522,17 +303,17 @@ def _write_training_metadata(
 # Per-worker text cache. Each worker process lazily loads language texts from
 # the disk cache (populated by the download phase) and caches them here to
 # avoid redundant disk reads when the same language is used across multiple
-# encodings.
+# encodings.  This relies on ProcessPoolExecutor (fork-based) — each forked
+# worker gets its own copy of this dict.
 _worker_text_cache: dict[str, list[str]] = {}
 
 
-def _build_one_model(  # noqa: PLR0913
+def _build_one_model(
     lang: str,
     enc_name: str,
     codec: str,
     cache_dir: Path,
     max_samples: int,
-    min_weight: int,
 ) -> tuple[str, dict[tuple[int, int], int] | None, int, int]:
     """Build a single bigram model in a (possibly forked) worker process.
 
@@ -578,15 +359,14 @@ def _build_one_model(  # noqa: PLR0913
     if not encoded:
         return (model_key, None, len(all_texts), 0)
 
-    # Compute bigram frequencies
+    # Compute raw bigram frequencies (normalization happens later in main)
     freqs = compute_bigram_frequencies(encoded)
-    bigrams = normalize_and_prune(freqs, min_weight)
 
-    if not bigrams:
+    if not freqs:
         return (model_key, None, len(encoded), sum(len(e) for e in encoded))
 
     total_bytes = sum(len(e) for e in encoded)
-    return (model_key, bigrams, len(encoded), total_bytes)
+    return (model_key, freqs, len(encoded), total_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -615,7 +395,7 @@ def main() -> None:
     parser.add_argument(
         "--max-samples",
         type=int,
-        default=15000,
+        default=25000,
         help="Maximum number of text samples per language",
     )
     parser.add_argument(
@@ -654,11 +434,28 @@ def main() -> None:
         default=False,
         help="Keep existing cache even if exclusion set has changed",
     )
+    parser.add_argument(
+        "--from-raw-cache",
+        action="store_true",
+        default=False,
+        help="Skip download and model building; load raw bigram counts from "
+        "cache and re-run normalization and serialization only",
+    )
     args = parser.parse_args()
     cache_dir = Path(args.cache_dir)
     output_path = Path(args.output)
 
     start_time = time.time()
+
+    # Register cleanup handler early so it covers the download and build phases.
+    # HuggingFace streaming iterators can hold connections open and prevent
+    # normal Python shutdown, so we force-exit via os._exit as a last resort.
+    def cleanup():
+        """Kill all threads and subprocesses on exit."""
+        os._exit(0)
+
+    atexit.register(cleanup)
+    signal.signal(signal.SIGTERM, lambda s, f: cleanup())
 
     # Filter to requested encodings (or all)
     if args.encodings:
@@ -737,79 +534,111 @@ def main() -> None:
             max_workers=args.download_workers,
         )
         futures = {pool.submit(_fetch, lang): lang for lang in sorted_langs}
-        for future in concurrent.futures.as_completed(futures, timeout=600):
-            lang, count, stats = future.result(timeout=60)
-            lang_stats[lang] = stats
-            print(f"  {lang}: {count} texts")
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=600):
+                try:
+                    lang, count, stats = future.result(timeout=60)
+                except Exception as exc:
+                    lang = futures[future]
+                    print(f"  ERROR downloading {lang}: {exc}")
+                    continue
+                lang_stats[lang] = stats
+                print(f"  {lang}: {count} texts")
+        except concurrent.futures.TimeoutError:
+            pending = {futures[f] for f in futures if not f.done()}
+            print(f"  WARNING: download timed out for: {', '.join(sorted(pending))}")
         pool.shutdown(wait=False, cancel_futures=True)
         print()
 
-    # Build models for each encoding
-    print(f"=== Building bigram models ({args.build_workers} workers) ===")
-    models: dict[str, dict[tuple[int, int], int]] = {}
-    skipped = []
+    # Build raw bigram frequency models (or load from cache)
+    raw_cache_path = cache_dir / "raw_bigram_counts.pkl"
 
-    # Pre-verify codecs and collect work items
-    work_items: list[tuple[str, str, str, Path, int, int]] = []
-    for enc_name, langs in sorted(encoding_map.items()):
-        codec = None
-        codec_candidates = [enc_name]
-        normalized = enc_name.replace("-", "").replace("_", "").lower()
-        codec_candidates.append(normalized)
+    # raw_models: model_key -> raw frequency dict (not yet normalized)
+    raw_models: dict[str, dict[tuple[int, int], int]] = {}
+    skipped: list[str] = []
 
-        for candidate in codec_candidates:
-            if verify_codec(candidate):
-                codec = candidate
-                break
-
-        if codec is None:
-            print(f"  SKIP {enc_name}: codec not found")
-            skipped.append(enc_name)
-            continue
-
-        work_items.extend(
-            (lang, enc_name, codec, cache_dir, args.max_samples, args.min_weight)
-            for lang in langs
-        )
-
-    if args.build_workers == 1:
-        # Sequential mode (useful for debugging)
-        for item in work_items:
-            key, bigrams, samples, total_bytes = _build_one_model(*item)
-            if bigrams:
-                models[key] = bigrams
-                print(
-                    f"  {key}: {len(bigrams)} bigrams from "
-                    f"{samples} samples ({total_bytes:,} bytes)"
-                )
-            else:
-                print(f"  SKIP {key}: no usable bigrams")
+    if args.from_raw_cache and raw_cache_path.is_file():
+        print("=== Loading raw bigram counts from cache ===")
+        with raw_cache_path.open("rb") as f:
+            raw_models = pickle.load(f)  # noqa: S301
+        print(f"  Loaded {len(raw_models)} raw models from {raw_cache_path}")
+        print()
     else:
-        # Parallel mode
-        with concurrent.futures.ProcessPoolExecutor(
-            max_workers=args.build_workers,
-        ) as pool:
-            futures = {
-                pool.submit(_build_one_model, *item): item[1]  # enc_name for error msg
-                for item in work_items
-            }
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    key, bigrams, samples, total_bytes = future.result()
-                except Exception as exc:
-                    enc = futures[future]
-                    print(f"  ERROR {enc}: {exc}")
-                    continue
-                if bigrams:
-                    models[key] = bigrams
+        print(f"=== Building bigram models ({args.build_workers} workers) ===")
+
+        # Pre-verify codecs and collect work items
+        work_items: list[tuple[str, str, str, Path, int]] = []
+        for enc_name, langs in sorted(encoding_map.items()):
+            codec = None
+            codec_candidates = [enc_name]
+            normalized = enc_name.replace("-", "").replace("_", "").lower()
+            codec_candidates.append(normalized)
+
+            for candidate in codec_candidates:
+                if verify_codec(candidate):
+                    codec = candidate
+                    break
+
+            if codec is None:
+                print(f"  SKIP {enc_name}: codec not found")
+                skipped.append(enc_name)
+                continue
+
+            work_items.extend(
+                (lang, enc_name, codec, cache_dir, args.max_samples) for lang in langs
+            )
+
+        if args.build_workers == 1:
+            # Sequential mode (useful for debugging)
+            for item in work_items:
+                key, freqs, samples, total_bytes = _build_one_model(*item)
+                if freqs:
+                    raw_models[key] = freqs
                     print(
-                        f"  {key}: {len(bigrams)} bigrams from "
+                        f"  {key}: {len(freqs)} raw bigrams from "
                         f"{samples} samples ({total_bytes:,} bytes)"
                     )
                 else:
                     print(f"  SKIP {key}: no usable bigrams")
+        else:
+            # Parallel mode
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=args.build_workers,
+            ) as pool:
+                futures = {
+                    pool.submit(_build_one_model, *item): item[1] for item in work_items
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        key, freqs, samples, total_bytes = future.result()
+                    except Exception as exc:
+                        enc = futures[future]
+                        print(f"  ERROR {enc}: {exc}")
+                        continue
+                    if freqs:
+                        raw_models[key] = freqs
+                        print(
+                            f"  {key}: {len(freqs)} raw bigrams from "
+                            f"{samples} samples ({total_bytes:,} bytes)"
+                        )
+                    else:
+                        print(f"  SKIP {key}: no usable bigrams")
 
-    print()
+        # Cache raw counts for future --from-raw-cache runs
+        print(f"\n  Caching raw bigram counts to {raw_cache_path}")
+        with raw_cache_path.open("wb") as f:
+            pickle.dump(raw_models, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"  Cached {len(raw_models)} raw models")
+        print()
+
+    # Normalize and prune raw counts into final models
+    print("=== Normalizing and pruning ===")
+    models: dict[str, dict[tuple[int, int], int]] = {}
+    for key, freqs in sorted(raw_models.items()):
+        bigrams = normalize_and_prune(freqs, args.min_weight)
+        if bigrams:
+            models[key] = bigrams
+    print(f"  {len(models)} models after normalization")
 
     # Merge with existing models when retraining a subset
     if args.encodings:
@@ -866,16 +695,6 @@ def main() -> None:
         # 4 (name_len) + len(name) + 4 (num_entries) + 3*n (entries)
         model_bytes = 4 + len(name.encode("utf-8")) + 4 + 3 * n
         print(f"  {name:20s}: {n:6d} bigrams ({model_bytes:,} bytes)")
-
-    # Register cleanup handler to kill all threads and subprocesses on exit
-
-    def cleanup():
-        """Kill all threads and subprocesses on exit."""
-        # Force exit
-        os._exit(0)
-
-    atexit.register(cleanup)
-    signal.signal(signal.SIGTERM, lambda s, f: cleanup())
 
 
 if __name__ == "__main__":
