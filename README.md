@@ -10,6 +10,8 @@ chardet 7 is a ground-up, 0BSD-licensed rewrite of [chardet](https://github.com/
 Same package name, same public API — drop-in replacement for chardet 5.x/6.x, just much faster and more accurate.
 Python 3.10+, zero runtime dependencies, works on PyPy.
 
+[Read more details about the rewrite process.](https://dan-blanchard.github.io/blog/chardet-rewrite-controversy/)
+
 ## Why chardet 7?
 
 **99.3% accuracy** on 2,517 test files. **47x faster** than chardet 6.0.0
