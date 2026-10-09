@@ -32,15 +32,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from detector_env import build_compiled_wheel
 from utils import collect_test_files, normalize_language
 from utils import format_bytes as _format_bytes
+from utils import percentiles as _percentiles
 
-from chardet.equivalences import (
+from chardet.evaluation import (
     BIDIRECTIONAL_GROUPS,
     SUPERSETS,
     is_correct,
     is_equivalent_detection,
+    is_exact_match,
 )
+from chardet.registry import REGISTRY, lookup_encoding
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CHAR_DATASET_URL = "https://github.com/Ousret/char-dataset.git"
@@ -127,16 +131,25 @@ def _compute_benchmark_hash() -> str:
     removing, or modifying test files invalidates cached results.
     """
     scripts_dir = _PROJECT_ROOT / "scripts"
-    equiv_path = _PROJECT_ROOT / "src" / "chardet" / "equivalences.py"
+    chardet_dir = _PROJECT_ROOT / "src" / "chardet"
     paths = [
         scripts_dir / "benchmark_time.py",
         scripts_dir / "benchmark_memory.py",
         scripts_dir / "utils.py",
-        equiv_path,
+        # The acceptance rules every verdict is scored against.  These moved
+        # out of the (now deprecated) equivalences.py in 7.5; hashing the
+        # shim instead would leave the baseline caches -- which, unlike
+        # chardet's own, do not rotate with a dev version string -- holding
+        # verdicts scored under superseded rules.
+        chardet_dir / "evaluation.py",
+        chardet_dir / "output_names.py",
     ]
     h = hashlib.sha256()
     for p in paths:
-        h.update(p.read_bytes())
+        # Tolerate a missing file rather than taking the whole script down
+        # with it: these paths track another module's layout, and 8.0
+        # removes one of the modules this list has already pointed at.
+        h.update(p.read_bytes() if p.is_file() else b"")
     # Include test-data commit hash (changes when files are added/modified)
     data_dir = _PROJECT_ROOT / "tests" / "data"
     if data_dir.is_dir():
@@ -588,6 +601,21 @@ def _run_timing_subprocess(  # noqa: PLR0913
     return _TimingResult(results, timing, file_times, import_time, first_detect_time)
 
 
+def _is_cjk_encoding(name: str | None) -> bool:
+    """Whether *name* is a legacy CJK multi-byte encoding.
+
+    Every ``is_multibyte`` entry in the registry is CJK (Big5, GB, EUC,
+    Shift_JIS, ISO-2022, Johab), so that flag is the classifier. UTF-8/16/32
+    are excluded: they carry CJK text but skip the expensive disambiguation
+    path, which is what this split is meant to isolate.
+    """
+    if not name:
+        return False
+    canonical = lookup_encoding(name)
+    info = REGISTRY.get(canonical) if canonical else None
+    return bool(info and info.is_multibyte)
+
+
 # ---------------------------------------------------------------------------
 # 3x median timing
 # ---------------------------------------------------------------------------
@@ -694,6 +722,7 @@ def _measure_memory_subprocess(
             "traced_peak": 0,
             "rss_before": 0,
             "rss_after": 0,
+            "file_peaks": [],
         }
     return json.loads(result.stdout.strip().split("\n")[0])
 
@@ -714,9 +743,13 @@ def _record_result(  # noqa: PLR0913
     """Update a detector's stats dict with one detection result."""
     detector_stats["total"] += 1
     detector_stats["per_enc"][expected_encoding]["total"] += 1
-    if is_correct(expected_encoding, detected) or (
-        detected is not None
-        and is_equivalent_detection(filepath.read_bytes(), expected_encoding, detected)
+    if is_exact_match(expected_encoding, detected):
+        detector_stats["strict_correct"] += 1
+    # Lazily composed on purpose, not is_acceptable(): `or` short-circuits
+    # the disk read when the name-level check already accepts, and this
+    # runs once per (file, detector) pair — thousands of reads per run.
+    if is_correct(expected_encoding, detected) or is_equivalent_detection(
+        filepath.read_bytes(), expected_encoding, detected
     ):
         detector_stats["correct"] += 1
         detector_stats["per_enc"][expected_encoding]["correct"] += 1
@@ -830,6 +863,7 @@ def run_comparison(  # noqa: PLR0913
     for label in detector_labels:
         stats[label] = {
             "correct": 0,
+            "strict_correct": 0,
             "total": 0,
             "lang_correct": 0,
             "lang_total": 0,
@@ -845,6 +879,8 @@ def run_comparison(  # noqa: PLR0913
             "lang_failures": [],
             "time": 0.0,
             "file_times": [],
+            "cjk_file_times": [],
+            "non_cjk_file_times": [],
         }
 
     data_dir_str = str(data_dir)
@@ -950,6 +986,8 @@ def run_comparison(  # noqa: PLR0913
             import_times[label] = timing.import_time
             first_detect_times[label] = timing.first_detect_time
             filtered_file_times: list[float] = []
+            cjk_times: list[float] = []
+            non_cjk_times: list[float] = []
             for i, (expected, exp_lang, path_str, detected, det_lang) in enumerate(
                 timing.results
             ):
@@ -960,6 +998,8 @@ def run_comparison(  # noqa: PLR0913
                         continue
                 if i < len(timing.file_times):
                     filtered_file_times.append(timing.file_times[i])
+                    bucket = cjk_times if _is_cjk_encoding(expected) else non_cjk_times
+                    bucket.append(timing.file_times[i])
                 _record_result(
                     stats[label],
                     expected,
@@ -969,6 +1009,8 @@ def run_comparison(  # noqa: PLR0913
                     det_lang,
                 )
             stats[label]["file_times"] = filtered_file_times
+            stats[label]["cjk_file_times"] = cjk_times
+            stats[label]["non_cjk_file_times"] = non_cjk_times
 
     total = stats[detectors[0][0]]["total"]
 
@@ -1033,6 +1075,69 @@ def run_comparison(  # noqa: PLR0913
             f"(detection: {s['time']:.2f}s)"
         )
 
+    # -- CJK vs non-CJK latency --
+    if any(stats[x]["cjk_file_times"] for x in detector_labels):
+        print()
+        print("=" * 100)
+        print("LATENCY BY SCRIPT FAMILY (per-file, detection-only, milliseconds)")
+        print("=" * 100)
+        print(
+            f"  {'':>{max_label}}  {'group':>9}  {'files':>6}  {'mean':>9}  "
+            f"{'median':>9}  {'p95':>9}  {'p99':>9}  {'max':>9}"
+        )
+        print(
+            f"  {'-' * max_label}  {'-' * 9}  {'-' * 6}  {'-' * 9}  "
+            f"{'-' * 9}  {'-' * 9}  {'-' * 9}  {'-' * 9}"
+        )
+        for label in detector_labels:
+            for group, key in (
+                ("CJK", "cjk_file_times"),
+                ("non-CJK", "non_cjk_file_times"),
+            ):
+                ft = stats[label][key]
+                if not ft:
+                    continue
+                pct = _percentiles(ft, (50, 95, 99))
+                print(
+                    f"  {label:<{max_label}}  {group:>9}  {len(ft):>6}  "
+                    f"{statistics.mean(ft) * 1000:>8.2f}ms  "
+                    f"{pct[50] * 1000:>8.2f}ms  {pct[95] * 1000:>8.2f}ms  "
+                    f"{pct[99] * 1000:>8.2f}ms  {max(ft) * 1000:>8.2f}ms"
+                )
+        print()
+        print("  CJK = expected encoding is a legacy CJK multi-byte encoding")
+        print("        (Big5, GB, EUC, Shift_JIS, ISO-2022, Johab). UTF-8/16/32")
+        print("        count as non-CJK even when the text is CJK, since they")
+        print("        skip the multi-byte disambiguation path.")
+        print()
+
+    # -- Strict vs lenient scoring --
+    print()
+    print("=" * 100)
+    print("STRICT vs LENIENT ENCODING ACCURACY")
+    print("=" * 100)
+    print(f"  {'':>{max_label}}  {'lenient':>16}  {'strict':>16}  {'concession':>16}")
+    print(f"  {'-' * max_label}  {'-' * 16}  {'-' * 16}  {'-' * 16}")
+    for label in detector_labels:
+        s = stats[label]
+        lenient = s["correct"]
+        strict = s["strict_correct"]
+        lenient_pct = lenient / total if total else 0
+        strict_pct = strict / total if total else 0
+        gap_pp = (lenient_pct - strict_pct) * 100
+        print(
+            f"  {label:<{max_label}}  "
+            f"{f'{lenient} ({lenient_pct:.1%})':>16}  "
+            f"{f'{strict} ({strict_pct:.1%})':>16}  "
+            f"{f'+{lenient - strict} (+{gap_pp:.1f}pp)':>16}"
+        )
+    print()
+    print("  lenient    = supersets, byte-order variants, and decoded-output")
+    print("               equivalence all credited (the default scoring)")
+    print("  strict     = exact encoding match only, after alias normalization")
+    print("  concession = files a detector wins only under lenient scoring")
+    print()
+
     # -- Detection runtime distribution --
     print()
     print("=" * 100)
@@ -1040,11 +1145,11 @@ def run_comparison(  # noqa: PLR0913
     print("=" * 100)
     print(
         f"  {'':>{max_label}}  {'total':>10}  {'mean':>10}  "
-        f"{'median':>10}  {'p90':>10}  {'p95':>10}  {'max':>10}"
+        f"{'median':>10}  {'p90':>10}  {'p95':>10}  {'p99':>10}  {'max':>10}"
     )
     print(
         f"  {'-' * max_label}  {'-' * 10}  {'-' * 10}  "
-        f"{'-' * 10}  {'-' * 10}  {'-' * 10}  {'-' * 10}"
+        f"{'-' * 10}  {'-' * 10}  {'-' * 10}  {'-' * 10}  {'-' * 10}"
     )
     for label in detector_labels:
         ft = stats[label]["file_times"]
@@ -1053,14 +1158,13 @@ def run_comparison(  # noqa: PLR0913
             mean_ms = statistics.mean(ft) * 1000
             median_ms = statistics.median(ft) * 1000
             max_ms = max(ft) * 1000
-            if len(ft) >= 20:
-                q = statistics.quantiles(ft, n=20)
-                p90_ms = q[17] * 1000  # 18/20 = 90th percentile
-                p95_ms = q[18] * 1000  # 19/20 = 95th percentile
-            else:
-                p90_ms = p95_ms = 0.0
+            pct = _percentiles(ft, (90, 95, 99))
+            p90_ms = pct[90] * 1000
+            p95_ms = pct[95] * 1000
+            p99_ms = pct[99] * 1000
         else:
-            total_ms = mean_ms = median_ms = p90_ms = p95_ms = max_ms = 0.0
+            total_ms = mean_ms = median_ms = 0.0
+            p90_ms = p95_ms = p99_ms = max_ms = 0.0
         print(
             f"  {label:<{max_label}} "
             f"{total_ms:>9.0f}ms "
@@ -1068,6 +1172,7 @@ def run_comparison(  # noqa: PLR0913
             f"{median_ms:>9.2f}ms "
             f"{p90_ms:>9.2f}ms "
             f"{p95_ms:>9.2f}ms "
+            f"{p99_ms:>9.2f}ms "
             f"{max_ms:>9.2f}ms"
         )
 
@@ -1117,6 +1222,45 @@ def run_comparison(  # noqa: PLR0913
     print("  1st detect = time for first file detection (includes lazy initialization)")
     print("  time to 1st result = import + 1st detect")
     print()
+
+    # -- Per-detection memory distribution --
+    if memory and any(memory_results[x].get("file_peaks") for x in detector_labels):
+        print("=" * 100)
+        print("PEAK MEMORY PER DETECTION (per-file, detection-only)")
+        print("=" * 100)
+        print(
+            f"  {'':>{max_label}}  {'mean':>12}  {'median':>12}  "
+            f"{'p90':>12}  {'p95':>12}  {'p99':>12}  {'max':>12}"
+        )
+        print(
+            f"  {'-' * max_label}  {'-' * 12}  {'-' * 12}  "
+            f"{'-' * 12}  {'-' * 12}  {'-' * 12}  {'-' * 12}"
+        )
+        for label in detector_labels:
+            peaks = memory_results[label].get("file_peaks") or []
+            if peaks:
+                pct = _percentiles(peaks, (50, 90, 95, 99))
+                cells = [
+                    int(statistics.mean(peaks)),
+                    int(pct[50]),
+                    int(pct[90]),
+                    int(pct[95]),
+                    int(pct[99]),
+                    max(peaks),
+                ]
+                row = f"  {label:<{max_label}}  " + "  ".join(
+                    f"{_format_bytes(c):>12}" for c in cells
+                )
+            else:
+                row = f"  {label:<{max_label}}  " + "  ".join(
+                    f"{'---':>12}" for _ in range(6)
+                )
+            print(row)
+        print()
+        print("  Peak CPython allocations during a single detect() call, above the")
+        print("  memory already resident when that call started. C-extension")
+        print("  allocations (e.g. cchardet) are invisible to tracemalloc.")
+        print()
 
     # -- Per-encoding table --
     all_encodings = sorted(
@@ -1313,32 +1457,19 @@ def _run_for_python_version(  # noqa: PLR0913
             k: v for k, v in os.environ.items() if k != "HATCH_BUILD_HOOK_ENABLE_MYPYC"
         }
     elif args.mypyc:
-        # Build a mypyc-compiled wheel so the venv gets compiled extensions.
+        # Build a compiled wheel so the venv gets compiled extensions.
         # Passing HATCH_BUILD_HOOK_ENABLE_MYPYC via env to `uv pip install`
         # doesn't reliably trigger the build hook, so we build explicitly.
         mypyc_wheel_dir = Path(tempfile.mkdtemp(prefix="chardet-mypyc-wheel-"))
-        print("Building mypyc wheel for local chardet ...")
-        build_cmd = [
-            "uv",
-            "build",
-            "--wheel",
-            "--out-dir",
-            str(mypyc_wheel_dir),
-            project_root,
-        ]
-        if python_version:
-            build_cmd.extend(["--python", python_version])
-        subprocess.run(
-            build_cmd,
-            check=True,
-            env={**os.environ, "HATCH_BUILD_HOOK_ENABLE_MYPYC": "true"},
-        )
-        wheels = list(mypyc_wheel_dir.glob("*.whl"))
-        if not wheels:
-            print("ERROR: mypyc wheel build produced no .whl file", file=sys.stderr)
+        try:
+            wheel = build_compiled_wheel(
+                Path(project_root), mypyc_wheel_dir, python_version=python_version
+            )
+        except RuntimeError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
             sys.exit(1)
-        chardet_pip_args = [str(wheels[0])]
-        print(f"  Built: {wheels[0].name}")
+        chardet_pip_args = [str(wheel)]
+        print(f"  Built: {wheel.name}")
 
     # Build venv specs: (label, pip_args, env, detector_type, python_version)
     venv_specs: list[_VenvSpec] = [

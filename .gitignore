@@ -7,6 +7,8 @@ build/
 .eggs/
 *.egg
 *.so
+# Cython-generated C from the _kernel build hook
+src/chardet/*.c
 *.pyd
 .venv/
 .env
@@ -20,6 +22,7 @@ tests/data
 tests/data/
 .claude/settings.local.json
 .worktrees/
+.claude/worktrees/
 uv.lock
 src/chardet/_version.py
 .benchmark_results/

@@ -4,7 +4,27 @@ from __future__ import annotations
 import re
 from unittest.mock import patch
 
-from chardet.pipeline.markup import detect_markup_charset
+import pytest
+
+import chardet.pipeline.markup as markup_mod
+from chardet.pipeline import DetectionResult
+from chardet.pipeline.markup import detect_markup_charset, promote_markup_superset
+from chardet.registry import EncodingInfo
+
+#: See the note in tests/test_confusion.py: mypyc resolves a compiled
+#: module's calls to functions imported into it at compile time, so patching
+#: those names only takes effect on interpreted builds.
+_needs_interpreted_build = pytest.mark.skipif(
+    markup_mod.__file__.endswith((".so", ".pyd")),
+    reason="patches a function the compiled module calls natively",
+)
+
+
+def test_promote_markup_superset_passthrough_none_encoding():
+    """promote_markup_superset passes through results with encoding=None."""
+    result = DetectionResult(None, 0.95, None, None)
+    allowed = frozenset({"cp932", "shift_jis_2004"})
+    assert promote_markup_superset(b"", result, allowed) is result
 
 
 def test_xml_encoding_declaration():
@@ -71,8 +91,17 @@ def test_unknown_encoding_returns_none():
 
 
 def test_lying_charset_declaration_rejected():
-    # Declares shift_jis but contains invalid bytes for that encoding
-    data = b'<meta charset="shift_jis">' + "日本語テスト".encode()
+    # Declares shift_jis but contains invalid bytes for that encoding.
+    #
+    # The body must be undecodable before its final character: validity
+    # tolerates an incomplete trailing one, so a body whose only defect is a
+    # dangling lead byte would pass.  It must also be undecodable under
+    # shift_jis_2004 -- what "shift_jis" resolves to, with a wider repertoire
+    # than shift_jis itself.
+    data = (
+        b'<meta charset="shift_jis">'
+        + "これは文字コード判定のテストに用いる日本語の文章です。".encode()
+    )
     result = detect_markup_charset(data)
     assert result is None
 
@@ -128,3 +157,77 @@ def test_pep263_non_ascii_coding_name():
     with patch("chardet.pipeline.markup._PEP263_RE", broad_re):
         result = detect_markup_charset(data)
     assert result is None
+
+
+def test_promote_when_reported_codec_cannot_decode():
+    """Declared Shift_JIS with CP932 NEC extensions promotes to cp932.
+
+    The internal shift_jis_2004 codec decodes NEC row 13 (e.g. 0x87 0x40,
+    the circled digit one), but the reported name "SHIFT_JIS" resolves to
+    plain shift_jis for callers, which cannot.  The promotion must fire
+    regardless of structural-score ties so the reported name can actually
+    decode the data.
+    """
+    data = "こんにちは".encode("shift_jis") + b"\x87\x40"
+    data.decode("cp932")  # sanity: superset decodes
+    result = DetectionResult("shift_jis_2004", 0.95, None, "text/xml")
+    allowed = frozenset({"cp932", "shift_jis_2004"})
+    promoted = promote_markup_superset(data, result, allowed)
+    assert promoted.encoding == "cp932"
+    assert promoted.confidence == 0.95
+    assert promoted.mime_type == "text/xml"
+
+
+def test_no_promotion_when_reported_codec_decodes_and_structure_ties():
+    """Plain Shift_JIS data stays shift_jis_2004 (no promotion on ties)."""
+    data = "こんにちは、世界。".encode("shift_jis")
+    result = DetectionResult("shift_jis_2004", 0.95, None, "text/html")
+    allowed = frozenset({"cp932", "shift_jis_2004"})
+    promoted = promote_markup_superset(data, result, allowed)
+    assert promoted.encoding == "shift_jis_2004"
+
+
+def test_ebcdic_meta_charset_declaration():
+    """A charset declaration inside EBCDIC-encoded markup is honoured.
+
+    The head is dominated by high bytes (EBCDIC letters), decodes through
+    cp037 to a ``<meta charset=...>`` tag naming a MAINFRAME-era encoding
+    that decodes the data, so the declaration wins.
+    """
+    html = "<meta charset=cp500><p>hello there dear reader of mainframe pages</p>"
+    data = html.encode("cp500")
+    result = detect_markup_charset(data)
+    assert result is not None
+    assert result.encoding == "cp500"
+    assert result.mime_type == "text/html"
+
+
+def test_ebcdic_declaration_ignored_for_non_mainframe_name():
+    """An EBCDIC-decoded declaration naming a non-MAINFRAME encoding is ignored."""
+    html = "<meta charset=utf-8><p>hello there dear reader of mainframe pages</p>"
+    data = html.encode("cp500")
+    result = detect_markup_charset(data)
+    assert result is None or result.encoding != "utf-8"
+
+
+@_needs_interpreted_build
+def test_promotion_when_superset_structure_scores_higher():
+    """The superset wins when its structural score beats the declared base.
+
+    Both codecs decode the data, so the decision falls to the structural
+    comparison; the scorer is patched to favour the superset, which is the
+    one regime the mutually-decodable inputs in the corpus never reach
+    (a genuine CP932-only byte already fails the shift_jis decode check).
+    """
+    data = "こんにちは、世界。".encode("shift_jis")
+    result = DetectionResult("shift_jis_2004", 0.95, None, "text/html")
+    allowed = frozenset({"cp932", "shift_jis_2004"})
+
+    def fake_score(head: bytes, info: EncodingInfo, ctx: object) -> float:
+        return 2.0 if info.name == "cp932" else 1.0
+
+    with patch.object(markup_mod, "compute_structural_score", fake_score):
+        promoted = promote_markup_superset(data, result, allowed)
+    assert promoted.encoding == "cp932"
+    assert promoted.confidence == result.confidence
+    assert promoted.mime_type == "text/html"

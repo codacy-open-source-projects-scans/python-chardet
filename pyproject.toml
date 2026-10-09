@@ -53,23 +53,50 @@ exclude = ["tests/data/", "data/"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/chardet"]
+# _kernel.pxd carries C type declarations that Cython reads at build time.
+# Nothing imports it at runtime, so it has no business in the wheel.
+exclude = ["src/chardet/*.pxd"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+# Off by default, like the mypyc hook below, so Cython and setuptools are not
+# build requirements of every source install --- including PyPy and any
+# platform with no prebuilt wheel, which would otherwise fetch Cython for a
+# wheel this hook does nothing to.  A compiled build enables both:
+#   HATCH_BUILD_HOOK_ENABLE_MYPYC=true HATCH_BUILD_HOOK_ENABLE_CUSTOM=true
+#
+# Enabling only one is safe, merely unoptimized: _kernel holds nothing but the
+# scoring loop, and models falls back to the dense in-module loop when the
+# extension is absent, so a mypyc-only wheel matches what it was before this
+# kernel existed.  Keeping the kernel that small is the point --- an earlier
+# version also moved the profile builder and the row-max bound out of their
+# mypyc modules, and a mypyc-only build of *that* was 1.5x slower than
+# compiling neither, because mypyc no longer saw those loops.
+enable-by-default = false
+path = "hatch_build_cython.py"
+dependencies = ["Cython>=3.0", "setuptools"]
 
 [tool.hatch.build.targets.wheel.hooks.mypyc]
 enable-by-default = false
-dependencies = ["hatch-mypyc>=0.16.0", "mypy>=1.15"]
+# mypy 1.15's generated C fails to compile on Python 3.14; 1.19 is the
+# oldest release verified to build all compiled modules there.
+dependencies = ["hatch-mypyc>=0.16.0", "mypy>=1.19"]
 require-runtime-dependencies = false
 include = [
     "/src/chardet/models/__init__.py",
+    "/src/chardet/models/_format.py",
     "/src/chardet/pipeline/structural.py",
     "/src/chardet/pipeline/validity.py",
     "/src/chardet/pipeline/statistical.py",
     "/src/chardet/pipeline/utf1632.py",
     "/src/chardet/pipeline/utf8.py",
     "/src/chardet/pipeline/escape.py",
+    "/src/chardet/pipeline/language.py",
+    "/src/chardet/pipeline/markup.py",
     "/src/chardet/pipeline/orchestrator.py",
     "/src/chardet/pipeline/confusion.py",
     "/src/chardet/pipeline/magic.py",
     "/src/chardet/pipeline/ascii.py",
+    "/src/chardet/pipeline/postprocess.py",
 ]
 mypy-args = ["--ignore-missing-imports"]
 options = { debug_level = "0" }
@@ -117,6 +144,12 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+# Build hook: hatchling fixes the method signatures, and the only subprocess
+# it runs is a setup script this file generates itself.
+"hatch_build_cython.py" = [
+    "ARG002",  # unused args are required by BuildHookInterface
+    "S603",    # the subprocess input is our own generated script
+]
 "tests/**" = [
     "S101",    # assert is standard in tests
     "S603",    # subprocess security not relevant in tests
@@ -179,6 +212,7 @@ ignore = [
 ]
 # mypyc-compiled modules cannot use `from __future__ import annotations`
 "src/chardet/models/__init__.py" = ["FA100"]
+"src/chardet/models/_format.py" = ["FA100"]
 "src/chardet/pipeline/structural.py" = ["FA100"]
 "src/chardet/pipeline/validity.py" = ["FA100"]
 "src/chardet/pipeline/statistical.py" = ["FA100"]
@@ -189,6 +223,9 @@ ignore = [
 "src/chardet/pipeline/confusion.py" = ["FA100"]
 "src/chardet/pipeline/magic.py" = ["FA100"]
 "src/chardet/pipeline/ascii.py" = ["FA100"]
+"src/chardet/pipeline/language.py" = ["FA100"]
+"src/chardet/pipeline/markup.py" = ["FA100"]
+"src/chardet/pipeline/postprocess.py" = ["FA100"]
 
 
 [tool.ruff.lint.pydocstyle]
@@ -202,7 +239,7 @@ indent-style = "space"
 source = ["src/chardet"]
 
 [tool.coverage.report]
-fail_under = 95
+fail_under = 100
 show_missing = true
 exclude_lines = [
     "pragma: no cover",
@@ -210,8 +247,14 @@ exclude_lines = [
 ]
 
 [tool.cibuildwheel]
-build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
+build = "cp310-* cp311-* cp312-* cp313-* cp314-* cp315-*"
 skip = "*-musllinux_*"
+# cibuildwheel 4.2.0 builds cp315 by default, so no `enable =
+# ["cpython-prerelease"]` is needed — and that flag must not return
+# unscoped: the release jobs run CIBW_BUILD='*', so an armed prerelease
+# flag would silently publish wheels against the next CPython's beta ABI
+# (immutable on PyPI) the moment the cibuildwheel pin is bumped during a
+# beta window.
 build-frontend = "build[uv]"
 test-command = "python -c \"import chardet; print(chardet.detect(b'hello world'))\""
 
@@ -226,12 +269,14 @@ archs = ["AMD64"]
 
 [dependency-groups]
 dev = [
-    "datasets>=4.6.0",
     "prek>=0.3.4",
     "pytest>=9.0.2",
     "pytest-cov>=7.0.0",
     "pytest-xdist>=3.5.0",
     "ruff>=0.15.2",
+]
+training = [
+    "datasets>=4.6.0",
 ]
 docs = [
     "sphinx>=8.0",

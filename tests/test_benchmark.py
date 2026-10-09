@@ -16,8 +16,8 @@ from pathlib import Path
 import pytest
 
 import chardet
-from chardet.models import _load_models_data, get_enc_index
-from chardet.pipeline.confusion import load_confusion_data
+from chardet.models import _load_models_data, get_enc_index, get_rowmax
+from chardet.pipeline.confusion import _modelled_languages, load_confusion_data
 from chardet.registry import get_candidates, lookup_encoding
 
 # ---------------------------------------------------------------------------
@@ -95,9 +95,11 @@ def _clear_all_caches():
     """Clear all functools.cache-decorated functions to simulate cold start."""
     _load_models_data.cache_clear()
     get_enc_index.cache_clear()
+    get_rowmax.cache_clear()
     get_candidates.cache_clear()
     lookup_encoding.cache_clear()
     load_confusion_data.cache_clear()
+    _modelled_languages.cache_clear()
 
 
 def _make_scaled_input(base: bytes, target_bytes: int) -> bytes:
@@ -117,10 +119,18 @@ def _make_scaled_input(base: bytes, target_bytes: int) -> bytes:
 
 # mypyc widens the gap between fast-path and statistical detection;
 # pure Python still needs headroom so use a lower threshold.
+#
+# The statistical reference must be size-matched to the ~2-4 KB fast-path
+# inputs: upper-bound pruning made statistical scoring of the bare 532-byte
+# Cyrillic sample so cheap that the ratio collapsed to 1.0-1.2x on CI
+# runners and lost all discrimination.  Against a like-sized statistical
+# input the ratio is ~3x pure / ~6x compiled on an M4 Max, and slower CI
+# hardware compresses it less because both sides scale together.
+_STATISTICAL_RATIO_DATA = CYRILLIC_WIN1251 * 8  # ~4.3 KB, like the fast inputs
 _HAS_MYPYC = any(Path(chardet.__file__).parent.rglob("*.so")) or any(
     Path(chardet.__file__).parent.rglob("*.pyd")
 )
-_MIN_SPEEDUP = 3 if _HAS_MYPYC else 1.5
+_MIN_SPEEDUP = 2.5 if _HAS_MYPYC else 1.5
 
 
 @pytest.mark.parametrize(
@@ -137,7 +147,7 @@ _MIN_SPEEDUP = 3 if _HAS_MYPYC else 1.5
 )
 def test_ratio_fast_vs_statistical(label: str, fast_data: bytes):
     fast = _median_time(lambda: chardet.detect(fast_data), _ITERS_RATIO)
-    slow = _median_time(lambda: chardet.detect(CYRILLIC_WIN1251), _ITERS_RATIO)
+    slow = _median_time(lambda: chardet.detect(_STATISTICAL_RATIO_DATA), _ITERS_RATIO)
     ratio = slow / fast
     assert ratio >= _MIN_SPEEDUP, (
         f"{label} not fast enough vs statistical: {ratio:.1f}x (need {_MIN_SPEEDUP}x)"
@@ -168,8 +178,17 @@ def test_ratio_cold_vs_warm_model_loading():
     chardet.detect(CYRILLIC_WIN1251)
     cold = time.perf_counter() - start
 
+    # Absolute ceiling first: this is the assertion that actually guards cold
+    # start.  The ratio below inflates with every warm-path win -- pruning
+    # doubled it once, the packed kernel again -- so on its own it loosens
+    # exactly when detection gets faster, which is backwards for a regression
+    # guard.  Cold start is model loading and is ~0.05s; 0.5s is a 10x cushion.
+    assert cold < 0.5, f"Cold start too slow in absolute terms: {cold:.3f}s"
+
     ratio = cold / warm
-    assert ratio < 30, f"Cold start too slow vs warm: {ratio:.1f}x (max 30x)"
+    # Kept as a shape check rather than a tight bound.  Measured after the
+    # packed kernel: ~47x compiled under `-n auto`, ~45x standalone, ~13x pure.
+    assert ratio < 75, f"Cold start too slow vs warm: {ratio:.1f}x (max 75x)"
 
 
 # ---------------------------------------------------------------------------

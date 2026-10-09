@@ -29,19 +29,75 @@ How do I increase accuracy?
 - **Use encoding filters.** If you know exactly which encodings are
   possible, pass ``include_encodings`` to restrict the candidate set.
   Alternatively, use ``exclude_encodings`` to remove known false positives.
+- **Pass prefer_superset=True when decoding.** Detection examines at most
+  the first 200 KB, and only a superset encoding is guaranteed to decode
+  bytes beyond that window; the remap makes the result decode-safe.  The
+  default (``False``) skips the renaming and reports the detected
+  encoding under its own name --- note it is not a promise of the
+  *smallest* matching encoding, since detection may natively choose a
+  superset that fits the data better.  ``prefer_superset=True`` will
+  become the default in chardet 8.0.
 
 How is chardet different from charset-normalizer?
 --------------------------------------------------
 
 `charset-normalizer <https://github.com/jawah/charset_normalizer>`_ is
-an alternative encoding detector. Key differences:
+an alternative encoding detector.  The design difference comes first,
+because the numbers follow from it: charset-normalizer decodes
+candidate encodings and scores the decoded text for "mess" and
+coherence, with no trained models.  chardet scores raw bytes against
+per-language bigram models inside a staged pipeline (structure,
+validity, statistics).  Each choice has a cost the other avoids:
+chardet's compiled wheel is about 1 MB (665 KB pure), half of it
+bigram models, against charset-normalizer's roughly 250 KB, and
+chardet improves by retraining where charset-normalizer improves by
+refining heuristics.
+Credit where due on packaging: charset-normalizer proved the
+compiled-wheel pattern for this problem space, shipping optional
+mypyc-compiled wheels with a pure-Python fallback in 2022, years
+before chardet 7 took the same approach.  They have since replaced
+mypyc entirely with Cython, and the speed they recovered with that
+switch is what prompted chardet's own Cython experiments; chardet now
+compiles fifteen modules with mypyc and one scoring kernel with
+Cython.
 
-- **Accuracy:** chardet achieves 99.3% vs charset-normalizer's 85.4% on
-  the same test suite.
-- **Speed:** chardet is 1.5x faster with mypyc (551 vs 376 files/s).
-- **Memory:** chardet uses 1.5x less peak memory (52.9 vs 78.8 MiB).
-- **Language detection:** chardet detects language with 95.7% accuracy vs
-  charset-normalizer's 59.2%.
+The measured differences:
+
+- **Accuracy:** chardet achieves 99.7% vs charset-normalizer's 86.6% on
+  the same test suite --- 90.8% for charset-normalizer once the
+  BOM-less utf-7 files it documents as out of scope are set aside (see
+  :doc:`performance`).
+- **Speed:** chardet leads everywhere except the far tail --- 1.2x in
+  aggregate (2,641 vs 2,250 files/s), 2.0x at the median (0.15 vs
+  0.30ms), and 1.4x at p90 and p95, with a worst case 2.8x lower
+  (11.9 vs 33.8ms). charset-normalizer keeps p99 (2.59 vs our 3.86ms),
+  a gap concentrated in legacy CJK where their p99 is 1.77ms against
+  our 8.19ms. See :doc:`performance`.
+- **Accuracy convention:** our 99.7% credits supersets (Windows-1252 for
+  ISO-8859-1); scored on exact matches only it is 82.3% against
+  charset-normalizer's 78.2%. Both columns are published, but we
+  consider the superset the correct answer: detection reads at most the
+  first 200 KB, and only the superset is guaranteed to decode the rest
+  of the file --- the same reasoning behind the WHATWG/W3C Encoding
+  Standard's rule that browsers decode ``ascii`` and ``iso-8859-1``
+  content as ``windows-1252``. The strict gap is the convention, not
+  the detector: with superset remapping disabled
+  (``prefer_superset=False``) chardet scores 91.8% strict, still ahead
+  of charset-normalizer. See :doc:`performance`.
+- **Memory:** chardet uses 2.6x less peak memory (27.7 vs 71.0 MiB) and
+  1.6x less RSS. Per ``detect()`` call the ordering reverses ---
+  charset-normalizer allocates 58 KiB at the median against chardet's
+  537 KiB, but its p99 grows 13x to 785 KiB while chardet's stays flat
+  at 740 KiB. See :doc:`performance` for the full distribution.
+- **Language detection:** chardet detects language with 91.8% accuracy vs
+  charset-normalizer's 54.8%.
+- **Binary files and MIME types:** both detectors decline binary input
+  (``encoding=None``), but chardet also identifies *what* the file is:
+  every result carries a ``mime_type``, matched against 40+ magic-number
+  signatures for images, audio/video, archives, documents, executables,
+  and fonts, plus ``text/html``, ``text/xml``, and ``text/x-python`` for
+  markup (see :doc:`supported-mime-types`).  charset-normalizer offers
+  ``is_binary()``, a yes/no answer with no type identification.
 
 How is chardet different from cchardet?
 ----------------------------------------
@@ -49,10 +105,16 @@ How is chardet different from cchardet?
 `cchardet <https://github.com/faust-streaming/faust-cchardet>`_ wraps
 Mozilla's uchardet C/C++ library. Key differences:
 
-- **Accuracy:** chardet achieves 99.3% vs cchardet's 55.9%.
-- **Speed:** cchardet is faster (1.3s vs 4.6s) due to C implementation.
+- **Accuracy:** chardet achieves 99.7% vs cchardet's 60.1%.
+- **Speed:** cchardet 3.2.0 is 1.5x faster in aggregate (0.78s vs
+  1.19s across 3,138 files) and holds the better tail (p99 2.11ms vs
+  our 3.86ms), but chardet's worst case is 2.1x lower (11.9 vs 25.3ms).
+- **Memory:** chardet's peak footprint is 2.3x smaller (27.7 vs
+  64.5 MiB traced) with lower RSS (161 vs 186 MiB).
 - **Encoding breadth:** chardet supports 49 more encodings than cchardet,
   including EBCDIC, Mac, Baltic, and BOM-less UTF-16/32.
+- **Binary files:** chardet declines binary input with a ``mime_type``
+  identifying the format; cchardet has no binary handling at all.
 - **Dependencies:** chardet is pure Python with zero dependencies.
   cchardet requires a C compiler to build from source.
 
@@ -73,5 +135,14 @@ Does chardet work on PyPy?
 ---------------------------
 
 Yes. chardet is pure Python and works on PyPy without modification.
-The optional mypyc compilation is CPython-only; PyPy uses the pure-Python
-code path automatically.
+The optional compiled builds (mypyc and Cython) are CPython-only; PyPy
+uses the pure-Python code path automatically, and pays nothing for their
+existence --- the compiled scoring kernel is the only consumer of the
+data layout it introduces, so an interpreted install takes the same path
+it always did.
+
+PyPy is best judged by percentile rather than throughput. Its median
+detection (0.18ms) is level with compiled CPython, but its p99 is
+72--77ms against 3.1--3.4ms, because the JIT never warms up on rare,
+large inputs. On typical documents it is competitive with the compiled
+wheel; on a corpus with a heavy tail it is several times slower overall.

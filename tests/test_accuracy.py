@@ -16,9 +16,8 @@ from utils import collect_test_files, get_data_dir, normalize_language
 import chardet
 from chardet.detector import UniversalDetector
 from chardet.enums import EncodingEra
-from chardet.equivalences import (
-    is_correct,
-    is_equivalent_detection,
+from chardet.evaluation import (
+    is_acceptable,
     is_language_equivalent,
 )
 from chardet.registry import REGISTRY, lookup_encoding
@@ -37,17 +36,7 @@ _KNOWN_FAILURES: frozenset[str] = frozenset(
         "cp850-ms/culturax_00000.txt",
         "cp858-en/culturax_00000.txt",
         "cp858-ms/culturax_00000.txt",
-        "cp932-ja/y-moto.com.xml",
-        "gb2312-zh/_mozilla_bug171813_text.html",
         "iso-8859-15-en/culturax_00002.txt",
-        "iso-8859-16-hu/culturax_OSCAR-2019_82421.txt",
-        "iso-8859-16-ro/_ude_1.txt",
-        "macroman-en/culturax_mC4_84512.txt",
-        "macroman-id/culturax_mC4_114889.txt",
-        "utf-8-en/finnish-utf-8-latin-1-confusion.html",
-        "utf-16be-zh/sample_chinese_no_bom.txt",
-        "utf-16le-zh/sample_chinese_no_bom.txt",
-        "windows-1252-no/culturax_00002.txt",
     }
 )
 
@@ -59,14 +48,25 @@ _KNOWN_ERA_FILTERED_FAILURES: frozenset[str] = frozenset(
     {
         "cp500-es/culturax_mC4_87070.txt",
         "cp850-fi/culturax_00001.txt",
-        "cp932-ja/y-moto.com.xml",
-        "gb2312-zh/_mozilla_bug171813_text.html",
+        # Contains no u-double-acute bytes at all, so nothing in it can
+        # separate iso8859-2 from iso8859-16 the way Hungarian normally
+        # does.  Its only distinguishing bytes are five stray 0xA9/0xAB/
+        # 0xBB, which read as capital S-caron, T-caron, and t-caron under
+        # iso8859-2 but as copyright and guillemet punctuation under
+        # iso8859-16, and Windows-1250 takes the file on the surrounding
+        # prose regardless.
         "iso-8859-2-hu/torokorszag.blogspot.com.xml",
-        "iso-8859-16-hu/culturax_OSCAR-2019_82421.txt",
-        "iso-8859-16-ro/_ude_1.txt",
+        # One 0xDD is the pair's whole distinguishing evidence, and the
+        # rescore reads it under mac-turkish's Turkish model (a very
+        # common dotless i) rather than mac-roman's Danish one — the pair
+        # models disjoint languages, so the language restriction falls
+        # back to comparing every variant.  The category vote does get it
+        # right, but at (margin 4, 1 demotion event) it clears neither
+        # half of the decisive-override gate, which needs margin 8 and 2
+        # events.  Loosening either threshold to reach this file would
+        # re-enable single-byte overrides across every in-band pair,
+        # which is exactly what those constants exist to prevent.
         "macroman-da/culturax_mC4_83469.txt",
-        "utf-16be-zh/sample_chinese_no_bom.txt",
-        "utf-16le-zh/sample_chinese_no_bom.txt",
     }
 )
 
@@ -126,9 +126,7 @@ def test_detect(
         )
         return
 
-    assert is_correct(expected_encoding, detected) or is_equivalent_detection(
-        data, expected_encoding, detected
-    ), (
+    assert is_acceptable(data, expected_encoding, detected), (
         f"expected={expected_encoding}, got={detected} "
         f"(confidence={result['confidence']:.2f}, "
         f"language={language}, file={test_file_path.name})"
@@ -169,9 +167,7 @@ def test_detect_era_filtered(
         )
         return
 
-    assert is_correct(expected_encoding, detected) or is_equivalent_detection(
-        data, expected_encoding, detected
-    ), (
+    assert is_acceptable(data, expected_encoding, detected), (
         f"expected={expected_encoding}, got={detected} "
         f"(era={era!r}, confidence={result['confidence']:.2f}, "
         f"language={language}, file={test_file_path.name})"

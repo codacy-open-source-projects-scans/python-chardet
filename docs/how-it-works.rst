@@ -47,7 +47,10 @@ order:
 
 9. **Byte Validity Filtering** — Attempts to decode the data with each
    candidate encoding's Python codec. Any encoding that raises a decode
-   error is eliminated.
+   error is eliminated. An incomplete multi-byte sequence at the very end
+   of the data does not count as an error: detection input is usually a
+   prefix of a larger whole, so a partial trailing character means the
+   input was cut mid-character rather than that the encoding is wrong.
 
 10. **CJK Gating** — Eliminates CJK candidates that lack genuine
     multi-byte structure. Checks pair ratio, high-byte count, byte
@@ -66,7 +69,14 @@ order:
 13. **Post-processing** — Resolves confusion groups (encodings that are
     statistically hard to distinguish), demotes niche Latin encodings
     when a more common alternative scores similarly, and promotes KOI8-T
-    when appropriate.
+    when appropriate.  When statistical scores are effectively tied,
+    small priors break the deadlock: the more prevalent encoding era
+    wins evidence-free dead heats, bare-``\r`` line endings promote
+    classic-Mac candidates, and a winner from a language with no
+    documented legacy-encoding population (say, Scottish Gaelic in
+    ISO-8859-14) yields to a mainstream rival scoring within a hair.
+    These priors only ever act inside narrow score bands — a genuine
+    file in any supported language wins on its own evidence.
 
 Confidence Scores
 -----------------

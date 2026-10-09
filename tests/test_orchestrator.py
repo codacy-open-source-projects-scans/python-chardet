@@ -3,9 +3,23 @@ from __future__ import annotations
 
 import pytest
 
+import chardet.pipeline.orchestrator as _orchestrator_mod
 from chardet.enums import EncodingEra
 from chardet.pipeline import DetectionResult
-from chardet.pipeline.orchestrator import _try_promote_markup_superset, run_pipeline
+from chardet.pipeline.orchestrator import run_pipeline
+
+#: mypyc compiles a module's calls to functions defined in (or imported
+#: into) that same module into direct native calls, so replacing those
+#: names has no effect on a compiled build.  A test that mocks one to force
+#: an otherwise-unreachable branch then runs the real path instead and
+#: still passes, reporting coverage it does not have.  Audited: patching
+#: module *data* attributes (e.g. confusion._DENSE_HIT_DIVISOR) and
+#: attributes of uncompiled modules (e.g. importlib.resources.files) is
+#: observed on both builds and needs no guard.
+_needs_interpreted_build = pytest.mark.skipif(
+    _orchestrator_mod.__file__.endswith((".so", ".pyd")),
+    reason="patches a function the compiled module calls natively",
+)
 
 
 def test_empty_input():
@@ -157,13 +171,6 @@ def test_markup_superset_promotion_respects_exclude():
     assert result[0].encoding == "shift_jis_2004"
 
 
-def test_markup_superset_promotion_none_encoding():
-    """_try_promote_markup_superset should pass through results with encoding=None."""
-    result = DetectionResult(None, 0.95, None, None)
-    allowed = frozenset({"cp932", "shift_jis_2004"})
-    assert _try_promote_markup_superset(b"", result, allowed) is result
-
-
 def test_markup_superset_no_promotion_when_superset_cant_decode():
     """If superset can't decode the data, don't promote."""
     # 0x85 0x40 is valid shift_jis_2004 but invalid cp932
@@ -213,85 +220,6 @@ def test_fallback_result_when_no_valid_encoding():
     assert result[0].encoding is not None
 
 
-def test_demote_niche_latin():
-    """iso-8859-10 at top should be demoted when no distinguishing bytes."""
-    from chardet.pipeline.orchestrator import _demote_niche_latin  # noqa: PLC0415
-
-    results = [
-        DetectionResult("iso8859-10", 0.90, None),
-        DetectionResult("cp1252", 0.85, None),
-    ]
-    # Data with only bytes shared between iso-8859-10 and iso-8859-1
-    data = bytes([0xE9, 0xF6, 0xFC])  # é ö ü in both encodings
-    demoted = _demote_niche_latin(data, results)
-    assert demoted[0].encoding == "cp1252"
-
-
-def test_demote_niche_latin_no_demote_when_distinguishing():
-    """iso-8859-10 should NOT be demoted when distinguishing bytes are present."""
-    from chardet.pipeline.orchestrator import _demote_niche_latin  # noqa: PLC0415
-
-    results = [
-        DetectionResult("iso8859-10", 0.90, None),
-        DetectionResult("cp1252", 0.85, None),
-    ]
-    # 0xA1 differs between iso-8859-10 and iso-8859-1
-    data = bytes([0xA1, 0xE9, 0xF6])
-    demoted = _demote_niche_latin(data, results)
-    assert demoted[0].encoding == "iso8859-10"
-
-
-def test_promote_koi8t_with_tajik_bytes():
-    """KOI8-T should be promoted when Tajik-specific bytes are present."""
-    from chardet.pipeline.orchestrator import _promote_koi8t  # noqa: PLC0415
-
-    results = [
-        DetectionResult("koi8-r", 0.90, "ru"),
-        DetectionResult("koi8-t", 0.88, "tg"),
-    ]
-    # 0x80 is a Tajik-specific byte in KOI8-T
-    data = bytes([0x41, 0x80, 0x42])
-    promoted = _promote_koi8t(data, results)
-    assert promoted[0].encoding == "koi8-t"
-
-
-def test_promote_koi8t_no_promote_without_tajik_bytes():
-    """KOI8-T should NOT be promoted when no Tajik-specific bytes are present."""
-    from chardet.pipeline.orchestrator import _promote_koi8t  # noqa: PLC0415
-
-    results = [
-        DetectionResult("koi8-r", 0.90, "ru"),
-        DetectionResult("koi8-t", 0.88, "tg"),
-    ]
-    # Only Cyrillic-range bytes shared between KOI8-R and KOI8-T
-    data = bytes([0xC0, 0xC1, 0xC2])
-    promoted = _promote_koi8t(data, results)
-    assert promoted[0].encoding == "koi8-r"
-
-
-def test_promote_koi8t_returns_early_when_koi8t_absent():
-    """When KOI8-R is first but KOI8-T is not in results, return unchanged."""
-    from chardet.pipeline.orchestrator import _promote_koi8t  # noqa: PLC0415
-
-    results = [
-        DetectionResult("koi8-r", 0.90, "ru"),
-        DetectionResult("cp1251", 0.85, "ru"),
-    ]
-    data = bytes([0x80, 0xC0, 0xC1])  # 0x80 is Tajik-specific but KOI8-T absent
-    returned = _promote_koi8t(data, results)
-    assert returned is results  # same object, unchanged
-    assert returned[0].encoding == "koi8-r"
-
-
-def test_fill_metadata_produces_language():
-    """_fill_metadata should fill in language for single-language encodings."""
-    from chardet.pipeline.orchestrator import _fill_metadata  # noqa: PLC0415
-
-    results = [DetectionResult("koi8-r", 0.90, None)]
-    filled = _fill_metadata(b"test data", results)
-    assert filled[0].language is not None
-
-
 def test_confidence_clamped_to_one():
     """run_pipeline should never return confidence > 1.0."""
     # Use a CJK text that triggers the byte-coverage boost
@@ -303,49 +231,7 @@ def test_confidence_clamped_to_one():
         assert r.confidence <= 1.0
 
 
-def test_to_utf8_unknown_encoding():
-    """_to_utf8 with an unknown encoding should return None."""
-    from chardet.pipeline.orchestrator import _to_utf8  # noqa: PLC0415
-
-    result = _to_utf8(b"Hello world", "not-a-real-encoding")
-    assert result is None
-
-
-def test_to_utf8_passthrough():
-    """_to_utf8 with utf-8 encoding should return data unchanged."""
-    from chardet.pipeline.orchestrator import _to_utf8  # noqa: PLC0415
-
-    data = b"Hello \xc3\xa9"
-    result = _to_utf8(data, "utf-8")
-    assert result is data
-
-
-def test_demote_niche_latin_iso_8859_14():
-    """iso-8859-14 at top should be demoted when no distinguishing bytes."""
-    from chardet.pipeline.orchestrator import _demote_niche_latin  # noqa: PLC0415
-
-    results = [
-        DetectionResult("iso8859-14", 0.90, None),
-        DetectionResult("cp1252", 0.85, None),
-    ]
-    data = bytes([0xC0, 0xC1, 0xC2])
-    demoted = _demote_niche_latin(data, results)
-    assert demoted[0].encoding == "cp1252"
-
-
-def test_demote_niche_latin_windows_1254():
-    """windows-1254 at top should be demoted when no distinguishing bytes."""
-    from chardet.pipeline.orchestrator import _demote_niche_latin  # noqa: PLC0415
-
-    results = [
-        DetectionResult("cp1254", 0.90, None),
-        DetectionResult("cp1252", 0.85, None),
-    ]
-    data = bytes([0xC0, 0xC1, 0xE9])
-    demoted = _demote_niche_latin(data, results)
-    assert demoted[0].encoding == "cp1252"
-
-
+@_needs_interpreted_build
 def test_fallback_when_no_valid_candidates(monkeypatch: pytest.MonkeyPatch):
     """When validity filtering eliminates all candidates, return fallback."""
     from chardet.pipeline import orchestrator  # noqa: PLC0415
@@ -357,6 +243,7 @@ def test_fallback_when_no_valid_candidates(monkeypatch: pytest.MonkeyPatch):
     assert result[0].encoding is not None  # fallback, not None
 
 
+@_needs_interpreted_build
 def test_fallback_when_cjk_gate_eliminates_all(monkeypatch: pytest.MonkeyPatch):
     """When CJK gating eliminates all candidates, return fallback."""
     from chardet.pipeline import orchestrator  # noqa: PLC0415

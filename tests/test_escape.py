@@ -3,8 +3,15 @@
 
 from __future__ import annotations
 
+import time
+
 from chardet import detect
-from chardet.pipeline.escape import _is_valid_utf7_b64, detect_escape_encoding
+from chardet.pipeline.escape import (
+    _has_valid_utf7_sequences,
+    _is_embedded_in_base64,
+    _is_valid_utf7_b64,
+    detect_escape_encoding,
+)
 
 
 def test_iso_2022_jp_esc_dollar_b() -> None:
@@ -390,3 +397,39 @@ def test_utf7_rejects_hex_hash_in_requirements_file() -> None:
     )
     result = detect(data)
     assert result["encoding"] != "UTF-7"
+
+
+def test_embedded_base64_guard_boundary() -> None:
+    """The guard fires at four preceding base64 characters, not three."""
+    assert not _is_embedded_in_base64(b"abc+rest", 3)
+    assert _is_embedded_in_base64(b"abcd+rest", 4)
+    # Newlines are skipped rather than ending the walk, so a line-wrapped
+    # run still counts.
+    assert _is_embedded_in_base64(b"ab\ncd\n+rest", 6)
+    # A non-base64, non-newline byte ends the walk.
+    assert not _is_embedded_in_base64(b"ab cd+rest", 5)
+
+
+def test_utf7_validator_is_linear_in_base64_blobs() -> None:
+    """Line-wrapped base64 must not drive the '+' scan quadratic.
+
+    ``_is_embedded_in_base64`` skips newlines, so without an early exit at
+    the fourth character every '+' in a PEM-shaped blob rescans everything
+    before it.  At 128 KiB that cost 5.4s and grew as the square; the
+    bound below is ~1000x the fixed cost and still catches a relapse.
+    """
+    unit = b"+abc123def456ghi789jkl012mno345pqr678stu901vwx234yz\n"
+    blob = (unit * (131072 // len(unit) + 1))[:131072]
+    start = time.perf_counter()
+    _has_valid_utf7_sequences(blob, len(blob), len(blob))
+    assert time.perf_counter() - start < 1.0
+
+
+def test_utf7_base64_run_outrunning_the_bound_is_skipped() -> None:
+    """A base64 run that reaches max_end while more follows is not judged.
+
+    The run cannot be validated whole, so it must be skipped rather than
+    judged on a truncated prefix (ADR-0006).
+    """
+    data = b"+" + b"AAAA" * 10
+    assert _has_valid_utf7_sequences(data, max_start=10, max_end=5) is False

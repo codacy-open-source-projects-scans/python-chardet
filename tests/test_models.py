@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import struct
 import zlib
 from collections.abc import Callable
@@ -7,9 +8,10 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from train import deserialize_models, serialize_models
 
 import chardet.models as models_mod
+from chardet.models import _format
+from chardet.models._format import read_models, write_model_artifacts
 
 
 def test_enc_index_resolves_aliases() -> None:
@@ -169,22 +171,16 @@ def _expected_model_pairs() -> set[tuple[str, str]]:
     statistical (bigram) detection should have a corresponding trained model.
     """
     from chardet.registry import lookup_encoding  # noqa: PLC0415
-    from scripts.utils import get_data_dir  # noqa: PLC0415
+    from scripts.utils import collect_test_files, get_data_dir  # noqa: PLC0415
 
-    data_dir = get_data_dir()
     pairs: set[tuple[str, str]] = set()
-    for d in data_dir.iterdir():
-        if not d.is_dir():
+    for enc_display, lang, _fp in collect_test_files(get_data_dir()):
+        if enc_display is None or lang is None:
             continue
-        parts = d.name.rsplit("-", 1)
-        if len(parts) != 2 or parts[0] == "None":
-            continue
-        enc_display, lang = parts
         canonical = lookup_encoding(enc_display)
         if canonical is None or canonical in _STRUCTURAL_ENCODINGS:
             continue
-        if any(f.is_file() for f in d.iterdir()):
-            pairs.add((canonical, lang))
+        pairs.add((canonical, lang))
     return pairs
 
 
@@ -213,7 +209,7 @@ def test_all_test_data_pairs_have_models() -> None:
 
 
 # ---------------------------------------------------------------------------
-# serialize_models / deserialize_models roundtrip tests
+# write_model_artifacts / read_models roundtrip tests
 # ---------------------------------------------------------------------------
 
 
@@ -225,8 +221,8 @@ def tmp_models_path(tmp_path: Path) -> Path:
 def test_roundtrip_single_encoding(tmp_models_path: Path) -> None:
     """Serialize and deserialize a single encoding model."""
     original = {"utf-8": {(65, 66): 200, (0xC3, 0xA4): 150}}
-    serialize_models(original, tmp_models_path)
-    loaded = deserialize_models(tmp_models_path)
+    write_model_artifacts(original, tmp_models_path)
+    loaded = read_models(tmp_models_path)
     assert loaded == original
 
 
@@ -237,54 +233,64 @@ def test_roundtrip_multiple_encodings(tmp_models_path: Path) -> None:
         "iso-8859-1": {(0xE4, 0x20): 255},
         "shift_jis": {(0x82, 0xA0): 180, (0x83, 0x41): 90},
     }
-    serialize_models(original, tmp_models_path)
-    loaded = deserialize_models(tmp_models_path)
+    write_model_artifacts(original, tmp_models_path)
+    loaded = read_models(tmp_models_path)
     assert loaded == original
 
 
 def test_roundtrip_empty_bigrams(tmp_models_path: Path) -> None:
     """An encoding with zero bigrams should roundtrip correctly."""
     original = {"empty-enc": {}}
-    serialize_models(original, tmp_models_path)
-    loaded = deserialize_models(tmp_models_path)
+    write_model_artifacts(original, tmp_models_path)
+    loaded = read_models(tmp_models_path)
     assert loaded == original
 
 
 def test_roundtrip_zero_encodings(tmp_models_path: Path) -> None:
     """Zero encodings should roundtrip correctly."""
     original: dict[str, dict[tuple[int, int], int]] = {}
-    serialize_models(original, tmp_models_path)
-    loaded = deserialize_models(tmp_models_path)
+    write_model_artifacts(original, tmp_models_path)
+    loaded = read_models(tmp_models_path)
     assert loaded == original
 
 
-def test_deserialize_missing_file() -> None:
+def test_read_models_missing_file() -> None:
     """Missing file should return empty dict."""
-    result = deserialize_models(Path("/nonexistent/path/models.bin"))
+    result = read_models(Path("/nonexistent/path/models.bin"))
     assert result == {}
 
 
-def test_deserialize_empty_file(tmp_models_path: Path) -> None:
+def test_read_models_empty_file(tmp_models_path: Path) -> None:
     """Empty file should return empty dict."""
     tmp_models_path.write_bytes(b"")
-    result = deserialize_models(tmp_models_path)
+    result = read_models(tmp_models_path)
     assert result == {}
 
 
-def test_deserialize_trailing_bytes_raises(tmp_models_path: Path) -> None:
-    """File with trailing bytes after valid data should raise ValueError."""
+def test_read_models_missing_magic(tmp_models_path: Path) -> None:
+    """A file without the CMD2 magic is corrupt, not a legacy format."""
+    tmp_models_path.write_bytes(b"CMD1" + bytes(16))
+    with pytest.raises(ValueError, match="missing CMD2 magic"):
+        read_models(tmp_models_path)
+
+
+def test_read_models_ignores_post_stream_bytes(tmp_models_path: Path) -> None:
+    """Bytes after the zlib stream's end marker are ignored.
+
+    Matches the runtime reader (and whole-blob ``zlib.decompress``): the
+    training-side reader and the runtime loader share one parser, so both
+    tolerate trailing bytes the same way.
+    """
     original = {"utf-8": {(65, 66): 200}}
-    serialize_models(original, tmp_models_path)
-    # Append garbage bytes — zlib.decompress raises on trailing garbage
+    write_model_artifacts(original, tmp_models_path)
     tmp_models_path.write_bytes(tmp_models_path.read_bytes() + b"\xff\xff")
-    with pytest.raises(ValueError, match="Corrupt models file"):
-        deserialize_models(tmp_models_path)
+    assert read_models(tmp_models_path) == original
 
 
 def test_serialize_v2_magic(tmp_models_path: Path) -> None:
     """v2 format should start with CMD2 magic bytes."""
     original = {"test/enc": {(65, 66): 200, (0xC3, 0xA4): 150}}
-    serialize_models(original, tmp_models_path)
+    write_model_artifacts(original, tmp_models_path)
     data = tmp_models_path.read_bytes()
     assert data[:4] == b"CMD2"
 
@@ -296,12 +302,12 @@ def test_roundtrip_v2_multiple_encodings(tmp_models_path: Path) -> None:
         "fr/iso-8859-1": {(0xE4, 0x20): 255},
         "ja/shift_jis": {(0x82, 0xA0): 180, (0x83, 0x41): 90},
     }
-    serialize_models(original, tmp_models_path)
-    loaded = deserialize_models(tmp_models_path)
+    write_model_artifacts(original, tmp_models_path)
+    loaded = read_models(tmp_models_path)
     assert loaded == original
 
 
-def test_deserialize_v2_corrupt_zlib(tmp_models_path: Path) -> None:
+def test_read_models_corrupt_zlib(tmp_models_path: Path) -> None:
     """Corrupt zlib data in v2 format should raise ValueError."""
     name = b"test/enc"
     header = b"CMD2"
@@ -309,11 +315,11 @@ def test_deserialize_v2_corrupt_zlib(tmp_models_path: Path) -> None:
     header += struct.pack("!I", len(name)) + name
     header += struct.pack("!d", 0.0)
     tmp_models_path.write_bytes(header + b"\xff\xff\xff")  # invalid zlib
-    with pytest.raises(ValueError, match="Corrupt models file"):
-        deserialize_models(tmp_models_path)
+    with pytest.raises(ValueError, match=r"corrupt models\.bin"):
+        read_models(tmp_models_path)
 
 
-def test_deserialize_v2_wrong_decompressed_size(tmp_models_path: Path) -> None:
+def test_read_models_wrong_decompressed_size(tmp_models_path: Path) -> None:
     """v2 with decompressed size != num_models * 65536 should raise ValueError."""
     name = b"test/enc"
     header = b"CMD2"
@@ -327,13 +333,13 @@ def test_deserialize_v2_wrong_decompressed_size(tmp_models_path: Path) -> None:
     blob = zlib.compress(bytes(65536), 9)
     tmp_models_path.write_bytes(header + blob)
     with pytest.raises(ValueError, match="decompressed size"):
-        deserialize_models(tmp_models_path)
+        read_models(tmp_models_path)
 
 
 def test_roundtrip_matches_load_models(tmp_path: Path) -> None:
-    """The production models.bin should roundtrip through serialize/deserialize."""
-    production_tables = models_mod.load_models()  # dict[str, memoryview]
-    # Convert memoryview tables back to dict format for serialize/deserialize roundtrip
+    """The production models.bin should roundtrip through the format module."""
+    production_tables = models_mod.load_models()  # dict[str, bytes]
+    # Convert byte tables back to dict format for the sparse roundtrip
     production_dicts: dict[str, dict[tuple[int, int], int]] = {}
     for name, table in production_tables.items():
         bigrams: dict[tuple[int, int], int] = {}
@@ -342,9 +348,42 @@ def test_roundtrip_matches_load_models(tmp_path: Path) -> None:
                 bigrams[(idx >> 8, idx & 0xFF)] = table[idx]
         production_dicts[name] = bigrams
     tmp_models = tmp_path / "roundtrip_models.bin"
-    serialize_models(production_dicts, tmp_models)
-    loaded = deserialize_models(tmp_models)
+    write_model_artifacts(production_dicts, tmp_models)
+    loaded = read_models(tmp_models)
     assert loaded == production_dicts
+
+
+def test_artifacts_regenerate_from_shipped_models_bin(tmp_path: Path) -> None:
+    """The rowmax/idf payloads must be exactly re-derivable from models.bin.
+
+    Proves the writer agrees with the shipped model artifacts.  The
+    row-maxima and IDF payloads are pure integer functions of the tables
+    and must match the shipped bytes exactly.  Compressed bytes legitimately
+    differ across zlib builds (CI's Windows zlib-ng vs the training Mac), so
+    models.bin is compared at the decompressed level, and rowmax.bin's
+    embedded SHA-256 — which hashes the compressed models.bin — is validated
+    against the locally written file rather than byte-compared to the
+    shipped header.
+    """
+    models_dir = Path(models_mod.__file__).parent
+    models = read_models(models_dir / "models.bin")
+    out = tmp_path / "models.bin"
+    write_model_artifacts(models, out)
+
+    regen_rowmax = (tmp_path / "rowmax.bin").read_bytes()
+    shipped_rowmax = (models_dir / "rowmax.bin").read_bytes()
+    header_size = _format.ROWMAX_HEADER_SIZE
+    assert regen_rowmax[:4] == shipped_rowmax[:4] == _format.ROWMAX_MAGIC
+    assert regen_rowmax[header_size:] == shipped_rowmax[header_size:]
+    assert regen_rowmax[4:header_size] == hashlib.sha256(out.read_bytes()).digest()
+
+    assert (tmp_path / "idf.bin").read_bytes() == (models_dir / "idf.bin").read_bytes()
+    old_tables, old_norms = _format.parse_models_bin(
+        (models_dir / "models.bin").read_bytes()
+    )
+    new_tables, new_norms = _format.parse_models_bin(out.read_bytes())
+    assert new_tables == old_tables
+    assert new_norms == old_norms
 
 
 @pytest.fixture
@@ -434,7 +473,7 @@ def test_load_models_v2_invalid_utf8_name(
 def test_load_models_v2_format(
     mock_models_bin: Callable[[bytes], None],
 ) -> None:
-    """v2 format should load via _parse_models_bin and produce correct tables."""
+    """v2 format should load via parse_models_bin and produce correct tables."""
     # Build a minimal v2 file with one model
     name = b"fr/cp1252"
     table = bytearray(65536)
@@ -490,10 +529,10 @@ def test_score_with_profile_fallback_norm():
     """score_with_profile with empty model_key should compute norm on the fly."""
     profile = models_mod.BigramProfile(b"\xc3\xa9\xc3\xa4")  # some high-byte bigrams
     # Build a model with a few non-zero entries
-    model = bytearray(65536)
-    model[(0xC3 << 8) | 0xA9] = 100
-    model[(0xC3 << 8) | 0xA4] = 80
-    score = models_mod.score_with_profile(profile, model, model_key="")
+    table = bytearray(65536)
+    table[(0xC3 << 8) | 0xA9] = 100
+    table[(0xC3 << 8) | 0xA4] = 80
+    score = models_mod.score_with_profile(profile, bytes(table), model_key="")
     assert isinstance(score, float)
     assert score > 0.0
 
@@ -501,7 +540,7 @@ def test_score_with_profile_fallback_norm():
 def test_score_with_profile_all_zeros_model():
     """All-zeros model should return 0.0 (model_norm == 0)."""
     profile = models_mod.BigramProfile(b"\xc3\xa9\xc3\xa4")
-    model = bytearray(65536)  # all zeros
+    model = bytes(65536)  # all zeros
     score = models_mod.score_with_profile(profile, model, model_key="")
     assert score == 0.0
 
@@ -514,9 +553,9 @@ def test_enc_index_alias_resolution() -> None:
     """
     # Create a fake model dict with a non-canonical encoding name.
     # "utf8" is a non-canonical alias for "utf-8".
-    fake_model = bytearray(65536)
-    fake_model[(0xC3 << 8) | 0xA9] = 100
-    fake_models = {"French/utf8": fake_model}
+    fake_table = bytearray(65536)
+    fake_table[(0xC3 << 8) | 0xA9] = 100
+    fake_models = {"French/utf8": bytes(fake_table)}
 
     index = models_mod._build_enc_index(fake_models)
 
@@ -526,3 +565,219 @@ def test_enc_index_alias_resolution() -> None:
     assert "utf-8" in index
     # Both should point to the same entries
     assert index["utf-8"] is index["utf8"]
+
+
+def test_rowmax_matches_models() -> None:
+    """rowmax.bin must stay in sync with models.bin.
+
+    Each model's rowmax table entry b1 must equal the maximum weight in the
+    model's row for lead byte b1.  A mismatch means rowmax.bin is stale
+    relative to models.bin and must be regenerated (scripts/train.py writes
+    both).
+    """
+    models = models_mod.load_models()
+    rowmax = models_mod.get_rowmax()
+    assert set(rowmax) == set(models)
+    for key, table in models.items():
+        derived = bytes(
+            max(table[start : start + 256]) for start in range(0, 65536, 256)
+        )
+        assert rowmax[key] == derived, f"rowmax.bin stale for model {key}"
+
+
+def test_decompress_tables_chunked_matches_whole() -> None:
+    """Incremental decompression must be feed-granularity independent."""
+    blob = bytes(range(256)) * 256  # exactly one 65536-byte table
+    compressed = zlib.compress(blob)
+    for chunk_size in (1, 7, 262144):
+        out = _format._decompress_tables(compressed, 0, ["m"], chunk_size)
+        assert out == {"m": blob}, f"chunk_size={chunk_size}"
+
+
+@pytest.mark.parametrize("chunk_size", [1, 262144])
+def test_decompress_tables_rejects_surplus_tables(chunk_size: int) -> None:
+    """A blob with more tables than the header claims must be rejected.
+
+    chunk_size=1 forces the boundary where the final claimed table
+    completes with the fed chunk fully consumed while surplus compressed
+    input is still unfed — the case a tail-only drain would miss.
+    """
+    # Deterministic incompressible filler (no PRNG): chained SHA-256.
+    blob = b"".join(
+        hashlib.sha256(i.to_bytes(4, "big")).digest() for i in range(65536 * 2 // 32)
+    )
+    compressed = zlib.compress(blob)
+    with pytest.raises(ValueError, match="decompressed size"):
+        _format._decompress_tables(compressed, 0, ["only-one"], chunk_size)
+
+
+def test_rowmax_bin_header_matches_models_bin() -> None:
+    """rowmax.bin must carry the CRM1 magic and the SHA-256 of models.bin.
+
+    A regenerated models.bin without a matching rowmax.bin regeneration
+    would silently under-estimate row maxima and break pruning's upper
+    bound, so the digest is the load-time staleness guard.
+    """
+    models_dir = Path(models_mod.__file__).parent
+    raw = (models_dir / "rowmax.bin").read_bytes()
+    assert raw[:4] == b"CRM1"
+    digest = hashlib.sha256((models_dir / "models.bin").read_bytes()).digest()
+    assert raw[4:36] == digest
+
+
+def test_rowmax_stale_digest_falls_back_with_warning() -> None:
+    """A rowmax.bin whose digest mismatches models.bin must be rejected.
+
+    The fallback derives the tables from the models directly, which is
+    slower but always correct, and warns so packaging mistakes get noticed.
+    """
+    models_dir = Path(models_mod.__file__).parent
+    real_models = (models_dir / "models.bin").read_bytes()
+    real_rowmax = (models_dir / "rowmax.bin").read_bytes()
+    stale = real_rowmax[:4] + bytes(32) + real_rowmax[36:]
+    contents = {"models.bin": real_models, "rowmax.bin": stale}
+
+    def fake_joinpath(name: str) -> MagicMock:
+        ref = MagicMock()
+        ref.read_bytes.return_value = contents[name]
+        return ref
+
+    models_mod.get_rowmax.cache_clear()
+    models_mod._load_models_data.cache_clear()
+    try:
+        with (
+            patch.object(
+                models_mod.importlib.resources,
+                "files",
+                return_value=MagicMock(joinpath=MagicMock(side_effect=fake_joinpath)),
+            ),
+            pytest.warns(RuntimeWarning, match="rowmax.bin"),
+        ):
+            derived = models_mod.get_rowmax()
+        assert derived
+    finally:
+        models_mod.get_rowmax.cache_clear()
+        models_mod._load_models_data.cache_clear()
+
+    # The fallback must produce exactly the tables the genuine file holds.
+    genuine = models_mod.get_rowmax()
+    assert derived == genuine
+    models_mod.get_rowmax.cache_clear()
+
+
+def test_rowmax_missing_file_falls_back_with_warning() -> None:
+    """A missing rowmax.bin must fall back to deriving the tables.
+
+    An install stripped of the auxiliary file still works: the tables are
+    derived from the models directly, with a warning so packaging mistakes
+    get noticed.
+    """
+    models_mod.load_models()  # keep the models cache warm past the patch
+
+    def fake_joinpath(name: str) -> MagicMock:
+        ref = MagicMock()
+        ref.read_bytes.side_effect = FileNotFoundError(name)
+        return ref
+
+    models_mod.get_rowmax.cache_clear()
+    try:
+        with (
+            patch.object(
+                models_mod.importlib.resources,
+                "files",
+                return_value=MagicMock(joinpath=MagicMock(side_effect=fake_joinpath)),
+            ),
+            pytest.warns(RuntimeWarning, match="rowmax.bin"),
+        ):
+            derived = models_mod.get_rowmax()
+    finally:
+        models_mod.get_rowmax.cache_clear()
+
+    genuine = models_mod.get_rowmax()
+    assert derived == genuine
+    models_mod.get_rowmax.cache_clear()
+
+
+def test_score_with_profile_accepts_bytearray_and_memoryview() -> None:
+    """The historical bytearray/memoryview table types must keep working.
+
+    mypyc enforces parameter types at runtime, so without explicit widening
+    a compiled install would raise TypeError where pure Python accepted the
+    call.
+    """
+    profile = models_mod.BigramProfile(b"\xc3\xa9\xc3\xa4")
+    table = bytearray(65536)
+    table[(0xC3 << 8) | 0xA9] = 100
+    expected = models_mod.score_with_profile(profile, bytes(table))
+    assert models_mod.score_with_profile(profile, table) == expected
+    assert models_mod.score_with_profile(profile, memoryview(bytes(table))) == expected
+
+
+def test_pack_profile_and_dot_packed_agree_with_dense_scoring() -> None:
+    """The packed kernel buffers must reproduce the dense dot product.
+
+    ``_kernel.py`` is the single implementation for both the compiled and
+    interpreted builds, so its arithmetic is checked directly against a
+    hand-computed dot product.
+    """
+    from chardet._kernel import dot_packed, pack_profile  # noqa: PLC0415
+
+    freq = [0] * 65536
+    freq[0x4142] = 3
+    freq[0x4243] = 5
+    idx, vals = pack_profile([0x4142, 0x4243], freq)
+    assert list(idx) == [0x4142, 0x4243]
+    assert list(vals) == [3, 5]
+    model = bytearray(65536)
+    model[0x4142] = 2
+    model[0x4243] = 10
+    assert dot_packed(idx, vals, bytes(model)) == 3 * 2 + 5 * 10
+
+
+def test_dense_profile_scores_identically_through_packed_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The packed-kernel scoring path must match the dense path exactly.
+
+    The module docstring calls this parity load-bearing: an interpreted run
+    never takes the packed branch on its own, so the flag is forced here to
+    pin the two branches together.  Scores must be bit-identical — same
+    integer dot product, same norms.
+    """
+    data = ("du texte français avec des accents é è ê " * 8).encode("cp1252")
+    model = bytes([1]) * 65536
+    expected = models_mod.score_with_profile(models_mod.BigramProfile(data), model)
+    assert expected > 0.0
+
+    monkeypatch.setattr(models_mod, "_KERNEL_COMPILED", True)
+    packed_profile = models_mod.BigramProfile(data)
+    assert len(packed_profile.idx_arr) > 0
+    assert models_mod.score_with_profile(packed_profile, model) == expected
+
+
+def test_decompress_tables_truncated_streams_raise() -> None:
+    """Every truncation of a two-table stream must raise, at any cut point.
+
+    Scanning all cuts pins down the exhausted-early exits, including the
+    one where ``flush()`` still yields a final mid-copy strand (the cut
+    that lands inside the back-reference crossing the first table's edge)
+    and the stream is only then found short.
+    """
+    blob = zlib.compress(b"A" * 66000)
+    for cut in range(len(blob)):
+        with pytest.raises(ValueError, match="decompressed size"):
+            _format._decompress_tables(blob[:cut], 0, ["a", "b"])
+
+
+def test_decompress_tables_accepts_unterminated_stream() -> None:
+    """A stream with all table bytes but no end marker parses successfully.
+
+    Mirrors whole-blob ``zlib.decompress`` leniency about trailing state:
+    once every table decompressed and a final flush yields nothing extra,
+    the absence of the deflate end marker is not an error.
+    """
+    payload = b"A" * 65536
+    compressor = zlib.compressobj()
+    blob = compressor.compress(payload) + compressor.flush(zlib.Z_SYNC_FLUSH)
+    tables = _format._decompress_tables(blob, 0, ["a"])
+    assert tables == {"a": payload}

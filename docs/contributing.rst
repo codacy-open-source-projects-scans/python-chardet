@@ -54,7 +54,7 @@ test suite):
 
 .. code-block:: bash
 
-   uv run python scripts/train.py
+   uv run --group training python scripts/train.py
 
 Training data is cached in ``data/`` (gitignored). Models are saved to
 ``src/chardet/models/models.bin``.
@@ -93,14 +93,22 @@ each stage either returns a definitive result or passes to the next:
 3. **Escape sequences** (``escape.py``) — ISO-2022-JP/KR, HZ-GB-2312
 4. **Magic numbers** (``magic.py``) — binary file type identification
 5. **Binary detection** (``binary.py``) — null bytes / control chars
-6. **Markup charset** (``markup.py``) — ``<meta charset>`` / ``<?xml encoding>``
+6. **Markup charset** (``markup.py``) — ``<meta charset>`` / ``<?xml encoding>`` extraction, plus superset promotion (Shift_JIS→CP932, EUC-KR→CP949) when structural evidence supports it
 7. **ASCII** (``ascii.py``) — pure 7-bit check
 8. **UTF-8** (``utf8.py``) — structural multi-byte validation
 9. **Byte validity** (``validity.py``) — eliminate invalid encodings
 10. **CJK gating** (in orchestrator) — eliminate spurious CJK candidates
 11. **Structural probing** (``structural.py``) — multi-byte encoding fit
 12. **Statistical scoring** (``statistical.py``) — bigram frequency models
-13. **Post-processing** (orchestrator) — confusion groups, niche demotion
+13. **Post-processing** (``postprocess.py``) — chained rank corrections: confusion-group resolution (delegated to ``confusion.py``), niche Latin demotion, KOI8-T promotion
+14. **Language detection** (``language.py``) — three-tier fill of the ``language`` field on every result (single-language map → multi-language bigram → UTF-8 fallback), runs after the core pipeline
+
+Accuracy-evaluation tables and predicates (``is_correct``,
+``is_equivalent_detection``, ``SUPERSETS``, ``LANGUAGE_EQUIVALENCES``,
+etc.) live in ``evaluation.py``.  Public-API encoding-name remapping
+(``apply_compat_names``, ``apply_preferred_superset``) lives in
+``output_names.py``.  The legacy ``equivalences.py`` module is a
+deprecation shim re-exporting both, scheduled for removal in 8.0.
 
 Key types:
 
@@ -116,21 +124,37 @@ Model format: binary file ``src/chardet/models/models.bin`` — sparse
 bigram tables loaded via ``struct.unpack``. Each model is a 65,536-byte
 lookup table indexed by ``(b1 << 8) | b2``.
 
-Optional mypyc Compilation
---------------------------
+Optional Compiled Builds
+------------------------
 
-Hot-path modules can be compiled to C extensions with
-`mypyc <https://mypyc.readthedocs.io>`_:
+Hot-path modules can be compiled to C extensions. Two hooks do it, and
+both should be enabled --- turning on only one is not wrong, just
+unoptimized:
 
 .. code-block:: bash
 
-   HATCH_BUILD_HOOK_ENABLE_MYPYC=true uv build
+   HATCH_BUILD_HOOK_ENABLE_MYPYC=true HATCH_BUILD_HOOK_ENABLE_CUSTOM=true uv build
+
+`mypyc <https://mypyc.readthedocs.io>`_ compiles the modules listed
+below. `Cython <https://cython.org>`_ compiles ``_kernel.py`` alone ---
+the bigram scoring loop --- using the build-time-only declarations in
+``_kernel.pxd``. Keep that kernel small: an earlier version also held
+the profile builder and the row-max bound, and moving those out of
+their mypyc modules made a mypyc-only build *slower* than compiling
+nothing, because mypyc stopped seeing those loops.
+
+A compiled build leaves nothing in the source tree. The Cython hook's
+``finalize`` deletes every in-tree extension, mypyc's included: a
+leftover ``.so`` shadows the ``.py`` beside it, is gitignored so
+``git status`` stays clean, and quietly makes later edits and
+"pure-Python" test runs meaningless.
 
 Compiled modules: ``models/__init__.py``, ``pipeline/structural.py``,
 ``pipeline/validity.py``, ``pipeline/statistical.py``,
 ``pipeline/utf1632.py``, ``pipeline/utf8.py``, ``pipeline/escape.py``,
 ``pipeline/orchestrator.py``, ``pipeline/confusion.py``,
-``pipeline/magic.py``, ``pipeline/ascii.py``.
+``pipeline/magic.py``, ``pipeline/ascii.py``, ``pipeline/language.py``,
+``pipeline/postprocess.py``.
 
 These modules cannot use ``from __future__ import annotations``
 (``FA100`` is ignored for them in ruff config).

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import chardet
 from chardet.enums import EncodingEra
-from chardet.equivalences import is_correct, is_equivalent_detection
+from chardet.evaluation import is_acceptable
 
 
 def _assert_detection(
@@ -25,9 +25,9 @@ def _assert_detection(
     """Assert that chardet detects the expected encoding (or an equivalent)."""
     result = chardet.detect(data, encoding_era=era, prefer_superset=True)
     detected = result["encoding"]
-    assert is_correct(expected, detected) or is_equivalent_detection(
-        data, expected, detected
-    ), f"expected={expected}, got={detected} (confidence={result['confidence']:.2f})"
+    assert is_acceptable(data, expected, detected), (
+        f"expected={expected}, got={detected} (confidence={result['confidence']:.2f})"
+    )
 
 
 # =========================================================================
@@ -194,6 +194,86 @@ class TestEscapeSequences:
         """Issue #63: Long ASCII text with single trailing ESC byte."""
         # With enough ASCII bytes, the single ESC should not trigger binary
         _assert_detection(b"0" * 100 + b"\x1b", "ascii")
+
+    def test_plus_digits_not_utf7(self) -> None:
+        """Issue #371: ASCII text with a "+<digits>" run misdetected as UTF-7.
+
+        UTF-7 Guard C rejects base64 runs with no uppercase letters, but it
+        used ``bytes.islower()`` which is ``False`` for an all-digit run like
+        ``100`` (no cased characters), letting ``+100`` slip through and decode
+        as a valid UTF-16BE code unit.  Such a run has no uppercase letters and
+        must be treated as plain ASCII.
+        """
+        text = (
+            b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do "
+            b"eiusmod tempor incididunt ut labore et dolore magna aliqua.\n\n+100\n"
+        )
+        _assert_detection(text, "ascii")
+        # Other digit-only runs after '+' must also stay ASCII.
+        for run in (b"+200", b"+99", b"+2000000"):
+            _assert_detection(b"the value is " + run + b" units\n", "ascii")
+
+    def test_plus_uppercase_word_not_utf7(self) -> None:
+        """Issue #371 follow-up: pipe-delimited ASCII with "+LAY" runs.
+
+        Three uppercase base64 characters can pass the padding and surrogate
+        checks by accident (``LAY`` decodes to U+2C06, Glagolitic).  Guard D
+        now requires a dash-less single-unit block to decode into
+        U+0080-U+07FF, where every genuine lone accented character in the
+        utf-7 corpus lives and accidental uppercase runs do not.
+        """
+        _assert_detection(b"|16847+|\n|NAME,+LAY|\n" * 20, "ascii")
+        _assert_detection(
+            b"ID|AMOUNT|NAME\n16847+|100|SMITH,+JONES\n29383+|250|NAME,+LAY\n",
+            "ascii",
+        )
+
+    def test_lone_accent_still_utf7(self) -> None:
+        """Guard D must keep genuine sparse utf-7: lone accents amid ASCII.
+
+        Mirrors the three corpus files whose only shifted blocks are
+        dash-less single accented letters (all decode to U+0080-U+00FF).
+        """
+        data = "\u00e8 bello qui, \u00e0 Paris si va, \u00f9 pure\n".encode("utf-7") * 4
+        _assert_detection(data, "utf-7")
+
+    def test_utf7_signature_detected(self) -> None:
+        """A UTF-7 signature (U+FEFF as "+/v8-") must not read as ASCII."""
+        data = "\ufeffHello there, signed utf-7 content here.".encode("utf-7")
+        assert data.startswith(b"+/v8")
+        _assert_detection(data, "utf-7")
+
+    def test_utf7_signature_prefix_alone_is_not_utf7(self) -> None:
+        """ASCII that merely starts with signature bytes must stay ASCII.
+
+        The four UTF-7 signature prefixes are ordinary ASCII; a diff of V8
+        source paths begins with ``+/v8``.  The BOM entry therefore demands
+        the whole buffer decode as UTF-7 before it believes the prefix.
+        """
+        _assert_detection(
+            b"+/v8/src/api.cc\n+/v8/src/objects.h\nthese lines were added\n",
+            "ascii",
+        )
+        _assert_detection(b"+/v9 is the new deps path for the build\n", "ascii")
+
+    def test_dash_terminated_uppercase_run_not_utf7(self) -> None:
+        """Guard D applies with or without the dash: "+LAY-AWAY" stays ASCII."""
+        _assert_detection(b"|16847+|\n|NAME,+LAY-AWAY|\n" * 20, "ascii")
+        _assert_detection(
+            b"SOME NAME,+LAY THEN MORE TEXT FOLLOWS HERE OK\n" * 10, "ascii"
+        )
+
+    def test_lone_punctuation_and_cjk_units_stay_utf7(self) -> None:
+        """Dash-less lone em dashes, ellipses, and kanji are genuine UTF-7.
+
+        Python's encoder emits ``+IBQ`` (em dash) and ``+ZeU`` (kanji)
+        without dash terminators before direct characters; a guard that
+        only allowed Latin-supplement lone units flipped these to ASCII.
+        """
+        western = "The result — good.\nThe cost … high, but fine.\n" * 6
+        japanese = "The kanji for day is 日 in Japanese text.\n" * 5
+        _assert_detection(western.encode("utf-7"), "utf-7")
+        _assert_detection(japanese.encode("utf-7"), "utf-7")
 
 
 # =========================================================================
@@ -508,3 +588,29 @@ class TestNullSeparators:
         result = chardet.detect(data)
         assert result["encoding"] == "ascii"
         assert result["confidence"] == 0.99
+
+
+class TestIssue380:
+    r"""Issue #380: complete input detected as an encoding that cannot decode it.
+
+    ``b"mam\xe1"`` (iso-8859-1 ``mamá``) ranked utf-8 a hair above the
+    Latin candidates, and utf-8 cannot decode the dangling ``0xE1`` --- the
+    caller's very next ``.decode()`` raised.  When chardet has seen the
+    caller's entire input and the winner's only multi-byte evidence is the
+    dangling tail itself, the best rival that decodes completely now wins.
+    """
+
+    def test_mama_returns_an_encoding_that_decodes(self) -> None:
+        data = "mamá".encode("iso-8859-1")
+        result = chardet.detect(data)
+        assert result["encoding"] is not None
+        assert data.decode(result["encoding"]) == "mamá"
+
+    def test_dangling_tail_words_decode(self) -> None:
+        """The class, not just the instance: accented-final words round-trip."""
+        for word in ("mamá", "papá", "café olé", "groß"):
+            data = word.encode("iso-8859-1")
+            result = chardet.detect(data)
+            assert result["encoding"] is not None, word
+            decoded = data.decode(result["encoding"])
+            assert decoded, word
