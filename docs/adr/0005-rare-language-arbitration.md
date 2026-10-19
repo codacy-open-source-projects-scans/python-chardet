@@ -2,7 +2,7 @@
 
 A Croatian `.po` file detected as Scottish Gaelic in iso-8859-14. Not because of bad data — an audit showed the gd model is clean and language-faithful — but because the models were being honest about the wrong question: Gaelic orthography (`th`, `ch`, `an`, `ai`) legitimately scores English-dominant text well, iso-8859-14's high bytes happen to read Croatian `š/ž/đ` as plausible Gaelic vowels, and the ranking treats a Scottish Gaelic web page as exactly as likely as a Croatian one. For a thin-margin, low-confidence win, that flat prior is wrong: the world produced vastly more Croatian bytes than Gaelic ones in legacy encodings.
 
-The decision: **banded arbitration**, never an always-on prior. A new postprocess rank correction demotes a rare-language winner only when both gates open — its lead over the best prevalent-language candidate is under 0.02 *and* its absolute confidence is under 0.15. Language commonness is admissible exactly where the byte evidence has failed to discriminate. An always-on prior (prevalence weighting every score) was rejected: it changes confidence semantics and makes rare languages start behind everywhere, including on their own genuine files. Doing nothing was rejected because the measured equity cost of arbitration is nil — genuine Celtic files win by landslides (no prevalent rival in their top 8, or +0.28 margins) while the failure case sat at 0.007 — and the benefit accrues to the vastly more common real-world case.
+The decision: **banded arbitration**, never an always-on prior. A new postprocess rank correction demotes a rare-language winner only when both gates open — its lead over the best prevalent-language candidate is at most 0.02 *and* its absolute confidence is under 0.15. Language commonness is admissible exactly where the byte evidence has failed to discriminate. An always-on prior (prevalence weighting every score) was rejected: it changes confidence semantics and makes rare languages start behind everywhere, including on their own genuine files. Doing nothing was rejected because the measured equity cost of arbitration is nil — genuine Celtic files win by landslides (no prevalent rival in their top 8, or +0.28 margins) while the failure case sat at 0.007 — and the benefit accrues to the vastly more common real-world case.
 
 The rare set is a **hand-audited frozenset** (`gd`, `cy`, `ga`, `br`), not a corpus-derived tier. Upstream corpus sizes measure 2020s crawl volume, which is the wrong quantity (Welsh has a healthy modern web and had ~zero Latin-8-era text; Tajik is the reverse), they shift silently across retrains, and they cannot encode the judgment that actually matters: *deployment*, not standardization. The deployment evidence for iso-8859-14, graded from strongest to weakest:
 
@@ -45,7 +45,9 @@ two files re-measured first.
 
 The fill therefore demotes a rare winner only when the *original* input is
 under 128 bytes *and* its lead over the best prevalent-language variant is
-under 0.03 (`demote_thin_rare` in `models.score_best_language`; the caller
+under 0.03 (raised to 0.06 in the October 2026 addendum below, which
+re-measured every margin in the language tiers' weighted cosine;
+`demote_thin_rare` in `models.score_best_language`; the caller
 judges length, because tier 3 transcodes to UTF-8 and curly punctuation
 inflates 3x on the way). The flag is opt-in and the returned score is
 unchanged, so the encoding-ranking caller in `pipeline.statistical` stays
@@ -65,3 +67,30 @@ changed outcomes on the test suite, verified by an A/B recount. The audited
 rare set now lives in `chardet.models.RARE_LANGUAGES`, imported by both
 gates, so it cannot drift into two sets; `scripts/train.py` points its
 review warning at that name.
+
+## Addendum (October 2026): the band in the weighted cosine
+
+The language tiers now score in an IDF-weighted space on both sides (the
+input profile under IDF, each model normalized under the square root of
+IDF; `BigramProfile.for_language` and `langnorm.bin`), which fixed French
+text filling as Hungarian on the strength of the shared `é` bigram. The
+weighted cosine runs higher than the plain one, so the band's margin was
+re-measured rather than carried over. The calibrated English snippet now
+wins as Gaelic by 0.039 (was 0.027) and the pinned Irish casualty by 0.053
+(was 0.008); the band's margin moves from 0.03 to 0.06 so both still
+demote. Genuine sentinels widen: the Gaelic snippet leads by 0.265, Welsh by
+0.215, Irish by 0.143, all 2.4x or more outside the band, against the 1.5x
+headroom the old scale gave.
+
+One sentinel moved the other way. The 73-character all-ASCII Breton
+snippet, which the plain cosine gave to Breton by 0.065, now reads as
+Indonesian outright: on an input with no accented letters, normalizing
+each model under its rare-bigram mass charges Breton for accents the
+snippet never shows. It is pinned as a casualty, and the genuine-Breton
+sentinel carries one more sentence (101 characters, margin 0.204). The
+trade is the right way round on the corpus: across the 98 rare-language
+Unicode files, truncated to 64, 96, 128 and 256 bytes, the weighted cosine
+mislabels 41, 36, 22 and 9 against the plain cosine's 40, 34, 27 and 18,
+and both label all 98 correctly at 2 KB. The 128-byte length gate and the
+encoding-side 0.02/0.15 gate in `pipeline.postprocess` are untouched: the
+encoding ranking still scores in the plain cosine.

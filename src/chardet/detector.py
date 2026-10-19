@@ -15,6 +15,7 @@ from chardet._utils import (
 )
 from chardet.enums import EncodingEra, LanguageFilter
 from chardet.output_names import (
+    NARROWER_DISPLAY_NAMES,
     PREFERRED_SUPERSET,
     apply_compat_names,
     apply_preferred_superset,
@@ -159,7 +160,7 @@ class UniversalDetector:
         Runs the full detection pipeline on the buffered data.
 
         :returns: A dictionary with keys ``"encoding"``, ``"confidence"``,
-            and ``"language"``.
+            ``"language"``, and ``"mime_type"``.
         """
         if not self._closed:
             self._closed = True
@@ -196,9 +197,22 @@ class UniversalDetector:
         """The current best detection result."""
         if self._result is not None:
             d = self._result.to_dict()
+            # Copy the buffer only for a transform that reads it: the
+            # superset remap always does, the compat rename only for the
+            # four names whose display codec is narrower than the internal.
+            window = b""
+            if self._prefer_superset or (
+                self._compat_names and d["encoding"] in NARROWER_DISPLAY_NAMES
+            ):
+                window = bytes(self._buffer)
             if self._prefer_superset:
-                apply_preferred_superset(d, bytes(self._buffer))
+                apply_preferred_superset(
+                    d,
+                    window,
+                    include_encodings=self._include_encodings,
+                    exclude_encodings=self._exclude_encodings,
+                )
             if self._compat_names:
-                apply_compat_names(d)
+                apply_compat_names(d, window)
             return d
         return _NONE_RESULT.to_dict()

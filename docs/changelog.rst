@@ -8,191 +8,213 @@ Changelog
    Dan directed the design, reviewed all output, and takes responsibility for
    the result. Unmarked entries by Dan were written without AI assistance.
 
-Unreleased
-----------
+7.7.0 (2026-10-17)
+------------------
 
 **Features:**
 
-- Added ``-m``/``--mime-type`` flag to ``chardetect`` CLI — shows the
-  detected MIME type alongside the encoding, similar to ``file -i``
+- Added a ``-m``/``--mime-type`` flag to the ``chardetect`` CLI, which
+  shows the detected MIME type next to the encoding, like ``file -i``.
   (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude,
   `#384 <https://github.com/chardet/chardet/issues/384>`_)
 
 **Accuracy:**
 
-- cp864 Arabic now trains on contextually shaped text in visual
-  order.  The old training text forced every letter to its isolated
-  presentation form in logical order, a byte pattern no real cp864
-  system ever wrote.
+- Visual-order Hebrew is now detected.  The ISO-8859-8 model trains on
+  both bidi conventions, so 1990s visual-order pages come back as
+  ISO-8859-8 while logical-order text still prefers Windows-1255.
   (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
-- Visual-order Hebrew is now detected.  The ``he/iso8859-8`` model
-  trains on both bidi conventions, so 1990s visual-order pages are
-  detected as ISO-8859-8 while logical text prefers Windows-1255,
-  the name signaling the storage convention as in Mozilla's
-  universal charset detector algorithm.
+- cp864 Arabic now trains on contextually shaped text in visual order,
+  the way real cp864 systems stored it, instead of isolated letter
+  forms in logical order.
   (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
 
 **Performance:**
 
-- Large inputs no longer need ``max_bytes`` to stay fast.
-  ``detect(data, max_bytes=len(data))`` on a 272 MiB buffer now
-  finishes in about 0.13-0.23s, down from multiple seconds, on the
-  compiled and pure-Python builds alike.  UTF-8 validation is decode-based (CPython's strict decoder
-  enforces the identical rules at C speed, chunked so no matching
-  ``str`` is ever allocated) and stays exact over the whole window:
-  the UTF-8 verdict is validated, never sampled.  Candidate filtering,
-  structural probing, the UTF-7/HZ deep validators, and rank
-  corrections converge on the first 256 KB, a documented evidence cap
-  that sits above the default ``max_bytes`` so results for default
-  calls are bit-for-bit unchanged (verified against the full corpus
-  per file).  Escape sequences are bounded by where they *begin*, not
-  where they end, so one straddling that boundary is still judged
-  whole.  The new large-input tables in the performance docs cover
-  the details; ADR-0006 in the repo records the design.
+- Raising ``max_bytes`` on large inputs no longer gets slow.  On the
+  compiled build, ``detect(data, max_bytes=len(data))`` on 272 MiB takes
+  about 0.23s for cp1252 and 0.56s for Shift_JIS, down from several
+  seconds.  UTF-8 validation and a final decode of the winner still read
+  the whole window, so the answer still decodes it.  The other stages
+  stop at a 256 KB evidence cap, which sits above the default
+  ``max_bytes``, so default calls are unchanged, and the default 200 KB
+  cap is still the fastest path.  ADR-0006 has the design.
   (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
-- ``detect(data, max_bytes=n)`` with *n* past that 256 KB cap again
-  returns an encoding that decodes the whole window.  Validity filtering
-  converges on the cap, so a candidate that could not decode the rest of
-  the window was able to reach the top: Windows-1252 for a 300 KB
-  Latin-1 file whose only C1 bytes sit past the cap.  The ranking's
-  winner is now decoded over the whole window before it is returned, and
-  when it fails the next candidate that decodes takes over, the outcome
-  7.6.0 produced when validity read every byte.  Default calls are
-  unchanged; a window past the cap pays one C-speed decode of the
-  winner, which puts 272 MiB of cp1252 at about 0.23s and of Shift_JIS
-  at about 0.56s on the compiled build.
+- The UTF-7 ``+`` scan is no longer quadratic on line-wrapped base64
+  like PEM certificates, MIME attachments, and JWTs.  128 KiB of it went
+  from 5.4 seconds to 1.2 milliseconds.
   (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
-- ASCII and binary scans on large buffers no longer allocate
-  input-sized transients: ``detect_ascii`` gates on ``isascii()`` and
-  counts rather than materializing its remainder, and ``is_binary``
-  counts through bounded chunks and derives its second control-byte
-  total arithmetically instead of rescanning.
+- A head full of unclosed ``<meta`` or ``<?xml`` tags no longer makes the
+  markup scan quadratic, taking it from about 5 ms to about 20 µs.  A
+  literal ``<`` inside an attribute value now hides that one tag.
   (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
-- The UTF-7 ``+`` scan no longer goes quadratic on line-wrapped base64.
-  Its "is this ``+`` inside a base64 stream" guard skips newlines while
-  walking backward, so on PEM certificates, MIME attachments, and JWTs
-  every ``+`` rescanned everything before it.  It now stops at the
-  fourth character, which is all the verdict needs: 128 KiB of such
-  data went from 5.4 seconds to 1.2 milliseconds.
-  (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
+- An EBCDIC ``charset=`` or ``encoding=`` followed by whitespace and no
+  value no longer makes the declaration scan backtrack quadratically.
+  A crafted 4 KB document used to cost ``detect()`` about 60 ms.
+  (`Samina <https://github.com/Samin061>`_,
+  `#403 <https://github.com/chardet/chardet/pull/403>`_)
+- The pure-Python install on CPython scores bigram models with
+  ``operator.itemgetter`` instead of a Python loop, making ``detect()``
+  about 1.25x faster and ``detect_all()`` about 1.35x faster across the
+  test corpus.  Compiled builds and PyPy keep their existing paths.
+  (`Afonso Ribeiro <https://github.com/deadstrobe5>`_)
 
 **Bug Fixes:**
 
-- ``unittest.mock.patch.object`` on the deprecated ``chardet.equivalences``
-  shim now restores the patched name on exit.  The shim proxied reads
-  and writes to the owning module but not deletes, so the mock raised on
-  exit and left ``chardet.evaluation`` patched for the rest of the
-  process.  Deletes are proxied too, and ownership is fixed at import so
-  the delete-then-restore round trip lands on the owner both times.
+- Language labels on Unicode text no longer tilt toward accent-heavy
+  languages, so a French paragraph with a few accents stops coming back
+  as Hungarian.  Models and input are now scored in the same
+  IDF-weighted space.  Mislabels on the corpus's Unicode files fall from
+  140 to 104 of 1587 (French from 20 to 4), and encodings, confidences,
+  and MIME types do not move.
   (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
-- ``prefer_superset=True`` no longer hands back a name that cannot
-  decode the examined window.  The Windows code pages leave a few C1
-  positions undefined that their ISO subsets map (0x81, 0x8D, 0x8F,
-  0x90, 0x9D under Windows-1252), and the remap applied regardless; it
-  now checks the data and keeps the detected name when the superset
-  cannot decode it.  ``apply_preferred_superset`` takes an optional
-  ``data`` argument for the check.
+- Null-separated ASCII records with short fields, like ``find -print0``
+  output, no longer come back as UTF-16-LE at 0.95 with Chinese as the
+  language.  They get the answer longer records already got: binary, or
+  ASCII when the nulls are sparse.
   (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
-- ``UniversalDetector`` no longer reads a buffer that filled to exactly
-  ``max_bytes`` as the whole stream.  A ``feed()`` after the buffer was
-  full did not mark it truncated, so the decode-safety flip could read a
-  clipped multi-byte sequence as the end of the input and turn a correct
-  ``utf-8`` answer into whichever single-byte codec decodes the fragment.
+- Every answer now decodes the examined window under the name the
+  caller receives.  A BOM, a BOM-less UTF-16/32 null pattern, an ISO-2022
+  or HZ escape designation, or a ``<meta charset>``/``<?xml encoding>``
+  declaration was trusted without decoding the rest of the window, so a
+  confident answer could raise further in.  Each now has to decode the
+  whole window, and the 5.x/6.x display names ``EUC-JP``, ``SHIFT_JIS``,
+  ``Big5``, and ``ISO-2022-JP`` are used only when those narrower codecs
+  decode it too.
+  (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude;
+  `Samina <https://github.com/Samin061>`_,
+  `#394 <https://github.com/chardet/chardet/pull/394>`_,
+  `#396 <https://github.com/chardet/chardet/pull/396>`_)
+- A ``charset=`` inside another attribute, like a refresh URL, no longer
+  beats a real ``<meta charset>``, and a declaration naming an unknown
+  encoding no longer hides a later one that works.  A repeated attribute
+  now keeps its first value, and a ``<meta`` tag that never closes is
+  ignored.
+  (`Sash <https://github.com/SashaMIT>`_,
+  `#389 <https://github.com/chardet/chardet/pull/389>`_)
+- The ``charset`` parameter of a ``content`` attribute may now be quoted
+  or have spaces around its ``=``.
+  (`Huanyi Xie <https://github.com/xiehuanyi>`_,
+  `#398 <https://github.com/chardet/chardet/pull/398>`_)
+- Markup declarations are read the way the WHATWG prescan reads them.
+  Declarations inside ``<!-- -->`` comments are ignored, ``x-user-defined``
+  means Windows-1252, and a UTF-16 or UTF-32 label in ASCII markup means
+  UTF-8, so an ASCII page declaring ``utf-16le`` no longer comes back as
+  UTF-16-LE at 0.95.
   (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
-- ``detect_all()`` no longer resurrects a demoted niche Latin encoding.
-  The demotion moved iso-8859-10, iso-8859-14, windows-1254, or
-  HP-Roman8 to the end of the ranking but left it holding the top
-  confidence, and the sort ``detect_all()`` applies before returning put
-  it back at second place.  The demoted entry now takes the confidence
-  of the candidate it sits behind, so the ranking the pipeline returns
-  is ordered by confidence as documented.
+- PEP 263 cookies are resolved the way ``tokenize.detect_encoding``
+  resolves them, so ``iso-latin-1`` and similar spellings now work,
+  ``utf-8-sig`` means UTF-8, and a long first line no longer hides a
+  cookie on line 2.
   (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
-- Language detection now honors ``max_bytes``.  The language fill stage
-  was handed the caller's whole input and applied only its own 2 KB cap,
-  so ``detect(data, max_bytes=64)`` could still report a language derived
-  from up to 2 KB.
+- A PEP 263 cookie on line 2 counts only when line 1 is blank or a
+  comment, as in Python, so a ``coding=`` comment after a line of code
+  is ignored.
+  (`Huanyi Xie <https://github.com/xiehuanyi>`_,
+  `#391 <https://github.com/chardet/chardet/pull/391>`_)
+- An EBCDIC ``<?xml encoding="...">`` declaration now reports
+  ``text/xml`` instead of ``text/html``, which fixes the MIME type for
+  ten EBCDIC RSS feeds in the test corpus.
   (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
-- ``chardet.equivalences`` is reachable again as an attribute of the
-  package (``import chardet`` then ``chardet.equivalences.is_correct``),
-  which stopped working when ``__init__`` switched to importing
-  ``chardet.output_names``.  The shim also resolves every name the
-  pre-split module exposed, including the private tables and helpers;
-  passes rebinding through to the module that owns the name, so patching
-  a table on the shim reaches the code that reads it; and warns once per
-  name used, naming that name and its new home, instead of once per
-  process at import.  Importing the shim is no longer an error under
+- ``detect_all(prefer_superset=True)`` no longer lists the same name
+  twice.  Greek text came back as ``Windows-1253`` at two confidences;
+  each name now appears once, at its higher confidence.
+  (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
+- ``prefer_superset=True`` no longer swaps in a Windows code page that
+  cannot decode the data, like Windows-1252 for ISO-8859-1 text holding
+  0x81.  ``apply_preferred_superset`` takes an optional ``data``
+  argument for the check.
+  (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
+- ``prefer_superset=True`` now respects ``include_encodings`` and
+  ``exclude_encodings``, keeping the detected name when the filters rule
+  out its superset.
+  (`00200200 <https://github.com/00200200>`_,
+  `#393 <https://github.com/chardet/chardet/pull/393>`_)
+- ``chardetect`` now reads one byte past its 200 KB cap, so a multi-byte
+  sequence cut at the cap is treated as truncated input instead of the
+  end of the file.
+  (`00200200 <https://github.com/00200200>`_,
+  `#392 <https://github.com/chardet/chardet/pull/392>`_)
+- ``lookup_encoding``'s cache is now capped at 1024 entries.  Charset
+  names come from untrusted markup, so a stream of distinct spellings
+  could grow it without limit.
+  (`Samina <https://github.com/Samin061>`_,
+  `#390 <https://github.com/chardet/chardet/pull/390>`_)
+- ``UniversalDetector`` no longer treats a buffer filled to exactly
+  ``max_bytes`` as the whole stream, which could turn a correct
+  ``utf-8`` answer into a single-byte codec when a multi-byte sequence
+  was cut at the boundary.
+  (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
+- A UTF-32 file with a BOM no longer comes back as UTF-16, or as
+  ``utf-32-be`` with the BOM left in, when ``max_bytes`` ends the window
+  partway through a code unit.  The default cap is a multiple of four,
+  so only custom caps hit this.
+  (`Aryan R. Ganjoo <https://github.com/AryanRG>`_,
+  `#405 <https://github.com/chardet/chardet/pull/405>`_)
+- ``detect_all()`` no longer puts a demoted niche Latin encoding back
+  near the top.  The demoted entry now takes the confidence of the
+  candidate it sits behind, so the ranking is ordered by confidence as
+  documented.
+  (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
+- Language detection now honors ``max_bytes`` instead of always reading
+  up to 2 KB.
+  (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
+- The deprecated ``chardet.equivalences`` shim is reachable again after a
+  bare ``import chardet``, resolves every name the old module had, and
+  passes patches through to the module that owns each name, so
+  ``mock.patch.object`` on it restores cleanly.  It warns when a name is
+  used rather than at import, so importing it no longer fails under
   ``-W error::DeprecationWarning``.
   (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
-- A mostly-ASCII Windows-1252 file whose only non-ASCII content is a
-  lone accented-letter pair (one ``Ö``/``ö``) no longer detects as
-  HP-Roman8.  The niche Latin demotion stood down whenever the data
-  contained any byte the candidate decodes differently from ISO-8859-1,
-  but presence is symmetric: Windows-1252 reads that 0xD6 as ``Ö`` and
-  HP-Roman8 as ``ø``, so both candidates contain the byte and it alone
-  says nothing about which reading is right.  The demotion now
-  arbitrates the candidate against its swap target on the distinguishing
-  bytes the way confusion resolution arbitrates its pairs.  The bigram
-  models decide when they know the bytes, so one Welsh ``ŵ`` still keeps
-  ISO-8859-14.  Word shape decides when they do not, so a Kven ``đ`` in
-  Finnish prose keeps ISO-8859-10, a letter between letters beating the
-  superscript Windows-1252 reads there.  An evidence-free tie goes to the
-  prevalent encoding.  A candidate leading its swap target by more than
-  the confusion band is not second-guessed on a handful of bytes.
-  The demotion's replacement is likewise no longer picked by sub-epsilon
-  noise: among common Latin candidates tied with the best-placed of them,
-  era prevalence chooses (Windows-1252 over ISO-8859-1), while a
-  candidate leading its rivals by a real margin is still promoted on
-  confidence.  Some corpus files that came back as ISO-8859-1 now come
-  back as Windows-1252, an accepted superset answer for them.
+- A mostly-ASCII Windows-1252 file with a single ``Ö`` or ``ö`` no
+  longer detects as HP-Roman8.  The niche Latin demotion now compares
+  the candidate and its replacement on the bytes they read differently,
+  so one Welsh ``ŵ`` still keeps ISO-8859-14 and a Kven ``đ`` in Finnish
+  still keeps ISO-8859-10.  Some corpus files that came back as
+  ISO-8859-1 now come back as Windows-1252, an accepted superset.
   (`António Afonso <https://github.com/aadsm>`_ via Claude,
   `#383 <https://github.com/chardet/chardet/pull/383>`_)
-- An English file whose only non-ASCII letter is a capital ``É``, ``À``
-  or ``Ó`` no longer detects as MacRoman.  The MacRoman model reads those
-  bytes as the ellipsis and curly quotes English text is full of, which
-  handed it a lead worth 2e-5 and kept the era-prevalence prior from
-  stepping in: the prior stood down whenever the leading model weighted
-  any observed high-byte bigram.  It now arbitrates such a leader against
-  the prevalent candidate tied with it on the bytes the two read
-  differently, every language variant on both sides, and promotes the
-  prevalent candidate when it wins outright.  A tie keeps the leader, so
-  ISO-8859-1 results tied with Windows-1252 on data without C1 bytes are
-  unchanged.
+- An English file whose only non-ASCII letter is a capital ``É``,
+  ``À``, or ``Ó`` no longer detects as MacRoman, which reads those
+  bytes as the ellipsis and curly quotes.  The era-prevalence prior now
+  compares the two readings on the bytes they disagree on instead of
+  standing down.
   (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude,
   `#383 <https://github.com/chardet/chardet/pull/383>`_)
 
+**Deprecations:**
+
+- ``EncodingInfo.is_multibyte`` is now ``is_multibyte_cjk``, since the
+  flag marks CJK byte structure rather than width and is off for UTF-8,
+  UTF-16 and UTF-32.  The old attribute still works with a
+  ``DeprecationWarning`` and will be removed in 8.0.  ``EncodingInfo``
+  is internal and never reaches ``detect()`` callers.
+  (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
+
+**Documentation:**
+
+- The supported encodings table no longer lists UTF-8, UTF-16, UTF-32
+  and UTF-7 as single-byte.  The multi-byte column used to copy the
+  registry flag that marks CJK byte structure for the structural stage,
+  which is off for the Unicode encodings on purpose.  The generator now
+  asks each codec whether any character takes more than one byte.
+  (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
+
 **Build:**
 
-- ``scripts/verify_no_overlap.py --require-provenance`` exits non-zero
-  unless the training metadata records an exclusion set that matches
-  today's test data, for the release check.  The shipped metadata
-  currently records none: the iso8859-8 and cp864 subset retrains were
-  built against later test-data states than the other 351 models, and
-  only a full retrain can restore a single record for the set.
+- ``pipeline/markup.py`` is now compiled by mypyc (15 modules), so the
+  markup superset promotion that moved there no longer runs interpreted
+  in compiled wheels.
   (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
-- Test coverage is back to 100% and CI now enforces it
-  (``fail_under = 100``).  The newly covered paths include the EBCDIC
-  plausibility checks in binary detection, charset declarations inside
-  EBCDIC-encoded markup, the packed-kernel scoring branch (pinned
-  bit-identical to the dense path), the confusion stage's decisive-vote
-  and strict-tier promotions, the classic-Mac and dead-heat rank
-  corrections, and the model-file fallback/truncation paths.  Two
-  provably unreachable defensive guards are excluded with explanatory
-  ``pragma: no cover`` comments instead of synthetic tests.
+- Test coverage is back to 100%, and CI now enforces it.
   (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
-- The ``models.bin``/``rowmax.bin``/``idf.bin`` formats now have a
-  single owner, ``chardet.models._format``, called by both the trainer
-  and the runtime loader; the row-maxima and IDF payloads regenerate
-  byte-identically from ``models.bin``, whose own bytes are guaranteed
-  at the decompressed level (zlib output varies across builds).
+- The ``models.bin``, ``rowmax.bin``, ``idf.bin``, and ``langnorm.bin``
+  formats now have one owner, ``chardet.models._format``, shared by the
+  trainer and the runtime loader.
   (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
-- ``pipeline/markup.py`` is now compiled by mypyc, bringing the list to
-  15 modules.  The markup superset promotion moved into this module out
-  of the compiled orchestrator, which left it running interpreted in
-  every compiled wheel.  Its structural comparison now scores the first
-  4 KB rather than the whole input, matching the window the charset
-  declaration itself is validated on; the decode checks still read
-  everything, since what a caller can decode is a fact about their whole
-  input.
+- ``scripts/verify_no_overlap.py --require-provenance`` fails unless the
+  training metadata records an exclusion set matching the current test
+  data.  The shipped models record none until the next full retrain.
   (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
 
 7.6.0 (2026-08-14)

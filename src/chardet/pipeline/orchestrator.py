@@ -172,7 +172,7 @@ def _gate_cjk_candidates(
     """
     gated: list[EncodingInfo] = []
     for enc in valid_candidates:
-        if enc.is_multibyte:
+        if enc.is_multibyte_cjk:
             mb_score = compute_structural_score(data, enc, ctx)
             ctx.mb_scores[enc.name] = mb_score
             if mb_score < _CJK_MIN_MB_RATIO:
@@ -221,12 +221,12 @@ def _score_structural_candidates(
     confidence values to [0.0, 1.0] before returning to callers.
     """
     enc_lookup: dict[str, EncodingInfo] = {
-        e.name: e for e in valid_candidates if e.is_multibyte
+        e.name: e for e in valid_candidates if e.is_multibyte_cjk
     }
     valid_mb = tuple(
         enc_lookup[name] for name, _sc in structural_scores if name in enc_lookup
     )
-    single_byte = tuple(e for e in valid_candidates if not e.is_multibyte)
+    single_byte = tuple(e for e in valid_candidates if not e.is_multibyte_cjk)
     results = list(
         score_candidates(
             data[:_STAT_SCORE_MAX_BYTES],
@@ -289,7 +289,7 @@ def _run_pipeline_core(  # noqa: PLR0913
 
     # Stage 1a: BOM detection (runs first — BOMs are definitive and
     # UTF-16/32 data looks binary due to null bytes)
-    bom_result = detect_bom(data)
+    bom_result = detect_bom(data, input_truncated=input_truncated)
     if bom_result is not None and bom_result.encoding in allowed:
         return [bom_result]
 
@@ -297,7 +297,15 @@ def _run_pipeline_core(  # noqa: PLR0913
     # BOMs — must run before binary detection since these encodings contain
     # many null bytes that would trigger the binary check)
     utf1632_result = detect_utf1632_patterns(data)
-    if utf1632_result is not None and utf1632_result.encoding in allowed:
+    # The stage samples and decodes the first few KB only.  The answer has
+    # to decode the whole window, so a lone surrogate or out-of-range unit
+    # past the sample sends the input on to the other stages instead.
+    if (
+        utf1632_result is not None
+        and utf1632_result.encoding is not None
+        and utf1632_result.encoding in allowed
+        and decodes_without_error(data, utf1632_result.encoding)
+    ):
         return [utf1632_result]
 
     # Escape-sequence encodings (ISO-2022, HZ-GB-2312, UTF-7): must run
@@ -364,6 +372,8 @@ def _run_pipeline_core(  # noqa: PLR0913
                     markup_result.mime_type,
                 )
             ]
+        # The stage already holds every declaration it returns, and the
+        # promotion it may apply, to the whole window.
         markup_result = promote_markup_superset(data, markup_result, allowed)
         return [markup_result]
 
@@ -414,7 +424,7 @@ def _run_pipeline_core(  # noqa: PLR0913
     # Reuse scores already computed during the CJK gate above.
     structural_scores: list[tuple[str, float]] = []
     for enc in valid_candidates:
-        if enc.is_multibyte:
+        if enc.is_multibyte_cjk:
             score = ctx.mb_scores.get(enc.name)
             if score is None:  # pragma: no cover - gate always populates cache
                 score = compute_structural_score(evidence, enc, ctx)
